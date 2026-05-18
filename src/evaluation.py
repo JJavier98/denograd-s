@@ -1,3 +1,5 @@
+"""Metrics for denoising quality and downstream benchmark deltas."""
+
 import numpy as np
 from scipy.stats import pearsonr
 

@@ -1,4 +1,5 @@
 import gc
+import time
 
 import numpy as np
 from sklearn.linear_model import Ridge
@@ -13,6 +14,7 @@ from src.models.dnn import TabularDNN
 from src.models.lstm import MultivariateLSTM
 from src.models.xlstm_adapter import xLSTMAdapter
 from src.models.dlinear_adapter import DLinearAdapter
+from src.profiling import benchmark_inference, model_size_bytes
 from src.trainer import Trainer
 from src.utils import extract_data_from_loader
 
@@ -38,11 +40,35 @@ class PermuteAndRun(nn.Module):
         x = x.permute(0, 2, 1)
         return self.model(x)
 
-def run_regression_benchmark(loaders, data, device, benchmark_cfg=None):
+def run_regression_benchmark(
+    loaders,
+    data,
+    device,
+    benchmark_cfg=None,
+    artifact_cache=None,
+    cache_key=None,
+    reuse_cached=False,
+    profile_models=False,
+    return_metadata=False,
+):
     train_loader, val_loader, _ = loaders
     (X_train_tensor, y_train_tensor), _, (X_test_tensor, y_test_tensor) = data
 
+    artifact_name = f"regression_{cache_key}" if cache_key else "regression"
+    if reuse_cached and artifact_cache is not None:
+        cached = artifact_cache.load_json(artifact_name, kind="metrics")
+        if cached is not None:
+            if return_metadata:
+                profile_cached = artifact_cache.load_json(f"{artifact_name}_profile", kind="metrics")
+                return cached, (profile_cached or {})
+            return cached
+
     results = {}
+    metadata = {
+        "timings_seconds": {},
+        "model_stats": {},
+        "inference_profile": {},
+    }
 
     # Convert benchmark_cfg to dict if it is a DictConfig
     if benchmark_cfg is not None and hasattr(benchmark_cfg, 'keys'):
@@ -57,35 +83,42 @@ def run_regression_benchmark(loaders, data, device, benchmark_cfg=None):
 
     # 1. Ridge
     print("  -> Training Ridge...")
+    t0 = time.perf_counter()
     ridge_params = benchmark_cfg.get("ridge", {}) if benchmark_cfg else {}
     ridge = Ridge(**ridge_params)
     ridge.fit(X_train, y_train)
     y_pred_ridge = ridge.predict(X_test)
     results['Ridge'] = mean_squared_error(y_test, y_pred_ridge)
+    metadata["timings_seconds"]["Ridge"] = time.perf_counter() - t0
     del ridge; gc.collect()
 
     # 2. KNN
     print("  -> Training KNN...")
+    t0 = time.perf_counter()
     knn_params = benchmark_cfg.get("knn", {}) if benchmark_cfg else {}
     knn = KNeighborsRegressor(**knn_params)
     knn.fit(X_train, y_train)
     y_pred_knn = knn.predict(X_test)
     results['KNN'] = mean_squared_error(y_test, y_pred_knn)
+    metadata["timings_seconds"]["KNN"] = time.perf_counter() - t0
     del knn; gc.collect()
 
     # 3. XGBoost
     print("  -> Training XGBoost...")
+    t0 = time.perf_counter()
     xgb_params = benchmark_cfg.get("xgboost", {}) if benchmark_cfg else {}
     xgb = XGBRegressor(**xgb_params)
     xgb.fit(X_train, y_train)
     y_pred_xgb = xgb.predict(X_test)
     results['XGBoost'] = mean_squared_error(y_test, y_pred_xgb)
+    metadata["timings_seconds"]["XGBoost"] = time.perf_counter() - t0
     del xgb; gc.collect()
 
     # 4. TabPFN
     # TabPFN uses O(n²) attention — subsample for large datasets to avoid RAM OOM
     TABPFN_MAX_SAMPLES = 3_000
     print("  -> Training TabPFN...")
+    t0 = time.perf_counter()
     tabpfn_params = benchmark_cfg.get("tabpfn", {}) if benchmark_cfg else {}
 
     # Ensure ignore_pretraining_limits is set to True to handle large datasets
@@ -114,10 +147,12 @@ def run_regression_benchmark(loaders, data, device, benchmark_cfg=None):
     tpfn.fit(X_train_tpfn, y_train_tpfn)
     y_pred_tpfn = tpfn.predict(X_test)
     results['TabPFN'] = mean_squared_error(y_test, y_pred_tpfn)
+    metadata["timings_seconds"]["TabPFN"] = time.perf_counter() - t0
     del tpfn, X_train_tpfn, y_train_tpfn; gc.collect()
 
     # 5. DNN
     print("  -> Training DNN...")
+    t0 = time.perf_counter()
     # Determine input dim
     input_dim = X_train.shape[1]
     output_dim = y_train.shape[1] if len(y_train.shape) > 1 else 1
@@ -164,6 +199,21 @@ def run_regression_benchmark(loaders, data, device, benchmark_cfg=None):
         y_pred_dnn = best_nn_model(X_test_tensor.to(device)).cpu().numpy()
 
     results['DNN'] = mean_squared_error(y_test, y_pred_dnn)
+    metadata["timings_seconds"]["DNN"] = time.perf_counter() - t0
+    metadata["model_stats"]["DNN"] = model_size_bytes(best_nn_model)
+
+    if profile_models:
+        try:
+            example_batch = X_test_tensor[: min(64, X_test_tensor.size(0))]
+            metadata["inference_profile"]["DNN"] = benchmark_inference(
+                best_nn_model,
+                example_batch,
+                device=device,
+                warmup_runs=2,
+                timed_runs=5,
+            )
+        except (RuntimeError, ValueError, AttributeError) as e:
+            metadata["inference_profile"]["DNN"] = {"error": str(e)}
 
     # Free GPU and CPU memory after benchmark
     del best_nn_model, model, trainer, optimizer
@@ -171,22 +221,53 @@ def run_regression_benchmark(loaders, data, device, benchmark_cfg=None):
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
+    if artifact_cache is not None:
+        artifact_cache.save_json(results, artifact_name, kind="metrics")
+        artifact_cache.save_json(metadata, f"{artifact_name}_profile", kind="metrics")
+        artifact_cache.update_manifest(
+            artifact_name,
+            {
+                "metrics": str(artifact_cache.json_path(artifact_name, kind="metrics")),
+                "profile": str(artifact_cache.json_path(f"{artifact_name}_profile", kind="metrics")),
+            },
+        )
+
+    if return_metadata:
+        return results, metadata
     return results
 
 
-def run_ts_benchmark(loaders, device, benchmark_cfg=None):
+def run_ts_benchmark(
+    loaders,
+    device,
+    benchmark_cfg=None,
+    artifact_cache=None,
+    cache_key=None,
+    reuse_cached=False,
+    profile_models=False,
+    return_metadata=False,
+):
     """
     Benchmark for Time Series.
     Adapts 3D data (N, T, D) to 2D (N, T*D) for Sklearn models.
     """
     train_loader, val_loader, test_loader = loaders
 
+    artifact_name = f"ts_{cache_key}" if cache_key else "ts"
+    if reuse_cached and artifact_cache is not None:
+        cached = artifact_cache.load_json(artifact_name, kind="metrics")
+        if cached is not None:
+            if return_metadata:
+                profile_cached = artifact_cache.load_json(f"{artifact_name}_profile", kind="metrics")
+                return cached, (profile_cached or {})
+            return cached
+
     # Extract data to CPU tensors
     X_train, y_train = extract_data_from_loader(train_loader)
     X_test, y_test = extract_data_from_loader(test_loader)
 
     # Shapes: (N, T, D)
-    N_train, T, D = X_train.shape
+    N_train, _, _ = X_train.shape
     N_test, _, _ = X_test.shape
 
     # Flatten for Sklearn: (N, T*D)
@@ -202,6 +283,11 @@ def run_ts_benchmark(loaders, device, benchmark_cfg=None):
     y_test_flat = y_test.reshape(N_test, -1).numpy()
 
     results = {}
+    metadata = {
+        "timings_seconds": {},
+        "model_stats": {},
+        "inference_profile": {},
+    }
 
     # Convert benchmark_cfg to dict
     if benchmark_cfg is not None and hasattr(benchmark_cfg, 'keys'):
@@ -211,30 +297,37 @@ def run_ts_benchmark(loaders, device, benchmark_cfg=None):
 
     # 1. Ridge
     print("  -> Training Ridge (Flattened)...")
+    t0 = time.perf_counter()
     ridge_params = benchmark_cfg.get("ridge", {})
     ridge = Ridge(**ridge_params)
     ridge.fit(X_train_flat, y_train_flat)
     y_pred_ridge = ridge.predict(X_test_flat)
     results['Ridge'] = mean_squared_error(y_test_flat, y_pred_ridge)
+    metadata["timings_seconds"]["Ridge"] = time.perf_counter() - t0
 
     # 2. KNN
     print("  -> Training KNN (Flattened)...")
+    t0 = time.perf_counter()
     knn_params = benchmark_cfg.get("knn", {})
     knn = KNeighborsRegressor(**knn_params)
     knn.fit(X_train_flat, y_train_flat)
     y_pred_knn = knn.predict(X_test_flat)
     results['KNN'] = mean_squared_error(y_test_flat, y_pred_knn)
+    metadata["timings_seconds"]["KNN"] = time.perf_counter() - t0
 
     # 3. XGBoost
     print("  -> Training XGBoost (Flattened)...")
+    t0 = time.perf_counter()
     xgb_params = benchmark_cfg.get("xgboost", {})
     xgb = XGBRegressor(**xgb_params)
     xgb.fit(X_train_flat, y_train_flat)
     y_pred_xgb = xgb.predict(X_test_flat)
     results['XGBoost'] = mean_squared_error(y_test_flat, y_pred_xgb)
+    metadata["timings_seconds"]["XGBoost"] = time.perf_counter() - t0
 
     # 4. DNN (Flattened)
     print("  -> Training DNN (Flattened)...")
+    t0 = time.perf_counter()
 
     # Extract VAL data for early stopping
     X_val, y_val = extract_data_from_loader(val_loader)
@@ -299,9 +392,25 @@ def run_ts_benchmark(loaders, device, benchmark_cfg=None):
         y_pred_dnn = best_nn_model(X_test_tensor.to(device)).cpu().numpy()
 
     results['DNN'] = mean_squared_error(y_test_flat, y_pred_dnn)
+    metadata["timings_seconds"]["DNN"] = time.perf_counter() - t0
+    metadata["model_stats"]["DNN"] = model_size_bytes(best_nn_model)
+
+    if profile_models:
+        try:
+            example_batch = X_test_tensor[: min(64, X_test_tensor.size(0))]
+            metadata["inference_profile"]["DNN"] = benchmark_inference(
+                best_nn_model,
+                example_batch,
+                device=device,
+                warmup_runs=2,
+                timed_runs=5,
+            )
+        except (RuntimeError, ValueError, AttributeError) as e:
+            metadata["inference_profile"]["DNN"] = {"error": str(e)}
 
     # 5. LSTM (Deep Sequence Model)
     print("  -> Training LSTM (Deep Sequence Model)...")
+    t0 = time.perf_counter()
 
     # LSTM expects (Batch, Seq, Feat), we use X_train (unflattened) and TensorDataset
     # Time series require keeping temporal dimension
@@ -373,9 +482,25 @@ def run_ts_benchmark(loaders, device, benchmark_cfg=None):
         y_pred_lstm = y_pred_lstm.reshape(y_test_flat.shape)
 
     results['LSTM'] = mean_squared_error(y_test_flat, y_pred_lstm)
+    metadata["timings_seconds"]["LSTM"] = time.perf_counter() - t0
+    metadata["model_stats"]["LSTM"] = model_size_bytes(best_lstm_model)
+
+    if profile_models:
+        try:
+            example_batch = X_test[: min(64, X_test.size(0))].float()
+            metadata["inference_profile"]["LSTM"] = benchmark_inference(
+                best_lstm_model,
+                example_batch,
+                device=device,
+                warmup_runs=2,
+                timed_runs=5,
+            )
+        except (RuntimeError, ValueError, AttributeError) as e:
+            metadata["inference_profile"]["LSTM"] = {"error": str(e)}
 
     # 6. xLSTM
     print("  -> Training xLSTM...")
+    t0 = time.perf_counter()
 
     xlstm_params = benchmark_cfg.get("xlstm", {})
     hidden_dim_xs = xlstm_params.get("hidden_dim", 64)
@@ -423,12 +548,30 @@ def run_ts_benchmark(loaders, device, benchmark_cfg=None):
         with torch.no_grad():
             y_pred_xlstm = best_xlstm_model(X_test.float().to(device)).cpu().numpy()
         results['xLSTM'] = mean_squared_error(y_test_flat, y_pred_xlstm)
-    except Exception as e:
+        metadata["timings_seconds"]["xLSTM"] = time.perf_counter() - t0
+        metadata["model_stats"]["xLSTM"] = model_size_bytes(best_xlstm_model)
+
+        if profile_models:
+            try:
+                example_batch = X_test[: min(64, X_test.size(0))].float()
+                metadata["inference_profile"]["xLSTM"] = benchmark_inference(
+                    best_xlstm_model,
+                    example_batch,
+                    device=device,
+                    warmup_runs=2,
+                    timed_runs=5,
+                )
+            except (RuntimeError, ValueError, AttributeError) as e:
+                metadata["inference_profile"]["xLSTM"] = {"error": str(e)}
+    except (RuntimeError, ValueError, AttributeError) as e:
         print(f"    [Warning] xLSTM failed: {e}")
         results['xLSTM'] = float('inf')
+        metadata["timings_seconds"]["xLSTM"] = time.perf_counter() - t0
+        metadata["inference_profile"]["xLSTM"] = {"error": str(e)}
 
     # 7. OhShuLih (TSFEDL)
     print("  -> Training OhShuLih (TSFEDL)...")
+    t0 = time.perf_counter()
     oh_params = benchmark_cfg.get("ohshulih", {})
 
     try:
@@ -474,13 +617,31 @@ def run_ts_benchmark(loaders, device, benchmark_cfg=None):
             y_pred_oh = y_pred_oh.reshape(y_test_flat.shape)
 
         results['OhShuLih'] = mean_squared_error(y_test_flat, y_pred_oh)
+        metadata["timings_seconds"]["OhShuLih"] = time.perf_counter() - t0
+        metadata["model_stats"]["OhShuLih"] = model_size_bytes(best_oh)
 
-    except Exception as e:
+        if profile_models:
+            try:
+                example_batch = X_test[: min(64, X_test.size(0))].float()
+                metadata["inference_profile"]["OhShuLih"] = benchmark_inference(
+                    best_oh,
+                    example_batch,
+                    device=device,
+                    warmup_runs=2,
+                    timed_runs=5,
+                )
+            except (RuntimeError, ValueError, AttributeError) as e:
+                metadata["inference_profile"]["OhShuLih"] = {"error": str(e)}
+
+    except (RuntimeError, ValueError, AttributeError) as e:
         print(f"    [Warning] OhShuLih failed: {e}")
         results['OhShuLih'] = float('inf')
+        metadata["timings_seconds"]["OhShuLih"] = time.perf_counter() - t0
+        metadata["inference_profile"]["OhShuLih"] = {"error": str(e)}
 
     # 8. DLinear
     print("  -> Training DLinear...")
+    t0 = time.perf_counter()
 
     dlinear_params = benchmark_cfg.get("dlinear", {})
 
@@ -529,8 +690,38 @@ def run_ts_benchmark(loaders, device, benchmark_cfg=None):
         with torch.no_grad():
             y_pred_dl = best_dl(X_test.float().to(device)).cpu().numpy()
         results['DLinear'] = mean_squared_error(y_test_flat, y_pred_dl)
-    except Exception as e:
+        metadata["timings_seconds"]["DLinear"] = time.perf_counter() - t0
+        metadata["model_stats"]["DLinear"] = model_size_bytes(best_dl)
+
+        if profile_models:
+            try:
+                example_batch = X_test[: min(64, X_test.size(0))].float()
+                metadata["inference_profile"]["DLinear"] = benchmark_inference(
+                    best_dl,
+                    example_batch,
+                    device=device,
+                    warmup_runs=2,
+                    timed_runs=5,
+                )
+            except (RuntimeError, ValueError, AttributeError) as e:
+                metadata["inference_profile"]["DLinear"] = {"error": str(e)}
+    except (RuntimeError, ValueError, AttributeError) as e:
         print(f"    [Warning] DLinear failed: {e}")
         results['DLinear'] = float('inf')
+        metadata["timings_seconds"]["DLinear"] = time.perf_counter() - t0
+        metadata["inference_profile"]["DLinear"] = {"error": str(e)}
 
+    if artifact_cache is not None:
+        artifact_cache.save_json(results, artifact_name, kind="metrics")
+        artifact_cache.save_json(metadata, f"{artifact_name}_profile", kind="metrics")
+        artifact_cache.update_manifest(
+            artifact_name,
+            {
+                "metrics": str(artifact_cache.json_path(artifact_name, kind="metrics")),
+                "profile": str(artifact_cache.json_path(f"{artifact_name}_profile", kind="metrics")),
+            },
+        )
+
+    if return_metadata:
+        return results, metadata
     return results

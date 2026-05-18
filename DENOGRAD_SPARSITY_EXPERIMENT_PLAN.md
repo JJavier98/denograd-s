@@ -2,6 +2,23 @@
 
 Montar en denograd-s un piloto reproducible que permita comprobar si DenoGrad mejora más cuando el backbone es sparse que cuando es denso. La comparación principal debe aislar el efecto del backbone sparse sobre el denoising, manteniendo fijo el benchmark downstream. La recomendación técnica es híbrida: masking con PyTorch/torch.ao para baseline y sparse-from-scratch, Torch-Pruning para pruning estructural, y torchao solo para 2:4 o block sparsity cuando haya soporte real de hardware.
 
+## Seguimiento
+
+- [x] Definir el plan experimental y el alcance del piloto.
+- [x] Añadir una política explícita de VRAM, tamaño de backbone y tiempo del proceso de denoising como métricas clave.
+- [x] Añadir una política explícita de caché y reutilización de artefactos.
+- [x] Crear la base ejecutable de soporte en `src/`: `Trainer`, `utils`, `evaluation` y caché/artefactos.
+- [x] Conectar `src/benchmark.py` con guardado opcional de resultados en caché.
+- [x] Añadir metadatos opcionales de tiempo/memoria en benchmark y manifiesto de artefactos por ejecución.
+- [x] Integrar la caché con un orquestador de experimentos y checkpoints reales de backbone/denoising.
+- [x] Añadir instrumentación de VRAM y tiempo del proceso de denoising de DenoGrad en tiempo de ejecución.
+- [x] Implementar funcionalidad de histograma global de pesos del backbone y análisis de distribución (normalidad y media cercana a 0).
+- [x] Implementar masking/pruning/2:4 para los backbones priorizados.
+- [x] Implementar métodos during-training: pruning gradual por magnitud y sparse-from-scratch con máscara fija.
+- [x] Implementar método baseline de sparsificación por magnitud (global unstructured) integrado al runner.
+- [x] Añadir reuso de datasets denoised y benchmarks por firma experimental completa.
+- [ ] Ejecutar el primer piloto tabular + temporal con comparación dense vs sparse.
+
 ## Tipos de sparsity
 
 - Masking o pruning no estructural: se ponen ceros en pesos individuales sin cambiar la forma de las capas. Es el punto de partida más barato para comparar hipótesis.
@@ -13,10 +30,10 @@ Montar en denograd-s un piloto reproducible que permita comprobar si DenoGrad me
 
 ### 1. Fase 0 — Infraestructura reproducible base
 
-- Portar o reimplementar en denograd-s las piezas experimentales que ya existen en el repo hermano: trainer, utils, evaluación de cambios, caché de noisy/denoised y patrón de configuración/orquestación.
-- Hacer ejecutable el flujo real que hoy está solo esbozado en src/benchmark.py: cargar clean, inyectar ruido, benchmark noisy, entrenar backbone, ejecutar DenoGrad, benchmark sobre denoised y registrar artefactos.
-- Definir un esquema único de resultados por run: dominio, dataset, seed, backbone, régimen de sparsity, ratio/patrón, hiperparámetros de DenoGrad, métricas before/after, tiempos y artefactos.
-- Definir desde el inicio una política de persistencia de estados intermedios para evitar recomputación: checkpoints de modelos densos y sparse, datasets noisy y denoised, salidas intermedias de DenoGrad, resúmenes de métricas y metadatos de ejecución.
+- [x] Portar o reimplementar en denograd-s las piezas experimentales que ya existen en el repo hermano: trainer, utils, evaluación de cambios, caché de noisy/denoised y patrón de configuración/orquestación.
+- [x] Hacer ejecutable el flujo real que hoy está solo esbozado en src/benchmark.py: cargar clean, inyectar ruido, benchmark noisy, entrenar backbone, ejecutar DenoGrad, benchmark sobre denoised y registrar artefactos.
+- [x] Definir un esquema único de resultados por run: dominio, dataset, seed, backbone, régimen de sparsity, ratio/patrón, hiperparámetros de DenoGrad, métricas before/after, tiempos y artefactos.
+- [x] Definir desde el inicio una política de persistencia de estados intermedios para evitar recomputación: checkpoints de modelos densos y sparse, datasets noisy y denoised, salidas intermedias de DenoGrad, resúmenes de métricas y metadatos de ejecución.
 
 ### 2. Fase 1 — Delimitar matriz de modelos y alcance piloto
 
@@ -115,6 +132,12 @@ Montar en denograd-s un piloto reproducible que permita comprobar si DenoGrad me
   - VRAM del backbone antes y después de sparsification: memoria reservada, memoria asignada y pico de memoria durante inferencia o denoising cuando se ejecute en CUDA;
   - MACs/FLOPs estimados;
   - cuando proceda, speedup sparse real frente al denso.
+- Métricas de distribución de pesos del backbone (nuevo bloque para justificar sparsity):
+  - histograma global de pesos del modelo completo (concatenando todos los parámetros entrenables) para denso y sparse;
+  - media, desviación estándar, asimetría y curtosis de la distribución de pesos;
+  - contraste de normalidad (por ejemplo, Shapiro-Wilk en submuestra o alternativa robusta para tamaños grandes) y error frente a una Normal ajustada;
+  - proporción de pesos en bandas alrededor de 0 (por ejemplo |w| < epsilon) para estimar masa cercana a cero;
+  - comparación before/after sparsification para verificar si la hipótesis de distribución aproximadamente normal centrada en 0 respalda un pruning por magnitud.
 - Métrica de interacción que responde la pregunta principal:
   - DenoGrad Benefit = error benchmark noisy - error benchmark denoised.
   - Sparse Synergy = Benefit con backbone sparse - Benefit con backbone denso.
@@ -129,6 +152,8 @@ Montar en denograd-s un piloto reproducible que permita comprobar si DenoGrad me
   - heatmaps de correlación y heatmaps de diferencias;
   - barras de mejora en SWD/correlación.
 - Gráficas de modelo:
+  - histogramas de pesos del backbone completo (denso vs sparse), con curva de densidad y superposición de Normal ajustada;
+  - QQ-plot de pesos para evaluar visualmente la hipótesis de normalidad;
   - curvas sparsity vs mejora downstream;
   - sparsity vs latencia/params/MACs/VRAM;
   - before/after de VRAM y tamaño del backbone para denso vs sparse;
@@ -193,6 +218,7 @@ Montar en denograd-s un piloto reproducible que permita comprobar si DenoGrad me
 6. Validar que las métricas de memoria y VRAM se capturan con el mismo protocolo en denso y sparse, incluyendo reset de picos de CUDA y mismo tamaño de lote.
 7. Antes de escalar a todos los datasets, reproducir el comportamiento de dense vs sparse en una segunda seed y comprobar que la ordenación noisy/denoised sigue siendo coherente.
 8. Verificar que la reutilización de caché no mezcla artefactos incompatibles, comprobando la firma experimental completa antes de reusar checkpoints, datasets denoised o resultados downstream.
+9. Verificar que cada run guarde artefactos de distribución de pesos del backbone: histograma (figura), estadísticos descriptivos y resultado del test de normalidad para denso y sparse.
 
 ## Decisions
 

@@ -1,3 +1,5 @@
+"""Training utilities with early stopping and checkpoint persistence."""
+
 import copy
 import os
 
@@ -30,7 +32,9 @@ class Trainer:
         epochs,
         checkpoints_path,
         verbose=False,
+        sparsity_controller=None,
     ) -> None:
+        """Initialize the trainer and state used during optimization."""
         self.model = model
         self.best_model = copy.deepcopy(self.model)
         self.train_dataloader = train_generator
@@ -42,19 +46,28 @@ class Trainer:
         self.batch_scheduler = batch_scheduler
         self.max_epochs = epochs
         self.best_val_loss = float("inf")
+        self.train_loss_when_best_val_loss = np.inf
         self.patience = patience
         self.current_patience = 0
         self.checkpoints_path = checkpoints_path
         self.verbose = verbose
+        self.sparsity_controller = sparsity_controller
 
     def __on_train_start(self):
+        """Hook executed once before the first training epoch."""
+        if self.sparsity_controller is not None:
+            self.sparsity_controller.on_train_start(self.model, self.max_epochs)
         if self.verbose:
             print("Training is started!")
 
-    def __on_train_epoch_start(self):
+    def __on_train_epoch_start(self, epoch):
+        """Set the wrapped model in training mode for a new epoch."""
+        if self.sparsity_controller is not None:
+            self.sparsity_controller.on_epoch_start(self.model, epoch, self.max_epochs)
         self.model.train(True)
 
     def __on_train_batch_start(self, batch_x, batch_y):
+        """Run forward/backward/update for one training batch and return batch loss."""
         batch_x = batch_x.to(self.device, dtype=torch.float32)
         batch_y = batch_y.to(self.device, dtype=torch.float32)
 
@@ -68,16 +81,21 @@ class Trainer:
         loss.backward()
         self.optimizer.step()
 
+        if self.sparsity_controller is not None:
+            self.sparsity_controller.on_after_optimizer_step(self.model)
+
         if self.batch_scheduler is not None:
             self.batch_scheduler.step()
 
         return loss.item()
 
     def __on_val_start(self):
+        """Switch the model to evaluation mode for validation."""
         self.model.train(False)
         self.model.eval()
 
     def __on_val_batch_start(self, batch_x_val, batch_y_val):
+        """Compute validation loss for one batch."""
         batch_x_val = batch_x_val.to(self.device, dtype=torch.float32)
         batch_y_val = batch_y_val.to(self.device, dtype=torch.float32)
 
@@ -88,6 +106,7 @@ class Trainer:
         return self.criterion(val_outputs, batch_y_val).item()
 
     def __early_stopping(self, val_loss, train_loss, epoch):
+        """Update early-stopping state and return True when training should stop."""
         if val_loss < self.best_val_loss:
             self.best_val_loss = val_loss
             self.train_loss_when_best_val_loss = train_loss
@@ -117,6 +136,7 @@ class Trainer:
         return False
 
     def fit(self):
+        """Train the model and return best checkpoint plus tracked losses."""
         self.train_loss_when_best_val_loss = np.inf
         self.best_val_loss = np.inf
         train_losses = []
@@ -134,7 +154,8 @@ class Trainer:
 
         for epoch in epochs_progress_bar:
             train_loss = 0.0
-            self.__on_train_epoch_start()
+            val_loss = np.inf
+            self.__on_train_epoch_start(epoch)
 
             batches_progress_bar = tqdm(
                 self.train_dataloader,
@@ -173,6 +194,11 @@ class Trainer:
                 }
                 if self.val_dataloader is not None and val_losses:
                     log_dict["backbone/val_loss"] = val_losses[-1]
+                if self.sparsity_controller is not None:
+                    sparsity_state = self.sparsity_controller.report()
+                    for key, value in sparsity_state.items():
+                        if isinstance(value, (int, float, bool)):
+                            log_dict[f"backbone/sparsity/{key}"] = value
                 wandb.log(log_dict)
 
             epochs_progress_bar.set_postfix_str(
@@ -190,7 +216,7 @@ class Trainer:
             if self.epoch_scheduler is not None:
                 try:
                     self.epoch_scheduler.step()
-                except Exception:
+                except (RuntimeError, ValueError, TypeError):
                     self.epoch_scheduler.step(tracked_val_loss)
 
         return (
@@ -202,6 +228,7 @@ class Trainer:
         )
 
     def eval_dataloader(self, data_generator):
+        """Run inference with the best model over a dataloader and return predictions."""
         predictions = []
         self.best_model.eval()
         for batch_x, _ in data_generator:
