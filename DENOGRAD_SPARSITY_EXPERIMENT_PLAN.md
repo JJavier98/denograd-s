@@ -16,8 +16,10 @@ Montar en denograd-s un piloto reproducible que permita comprobar si DenoGrad me
 - [x] Implementar masking/pruning/2:4 para los backbones priorizados.
 - [x] Implementar métodos during-training: pruning gradual por magnitud y sparse-from-scratch con máscara fija.
 - [x] Implementar método baseline de sparsificación por magnitud (global unstructured) integrado al runner.
+- [x] Corregir 2:4 con ruta hardware-aware (detección Ampere+, elegibilidad de capas lineales y reporte de backend acelerado activo/inactivo).
 - [x] Añadir reuso de datasets denoised y benchmarks por firma experimental completa.
-- [ ] Ejecutar el primer piloto tabular + temporal con comparación dense vs sparse.
+- [x] Ejecutar smoke piloto tabular + temporal dense vs sparse para validación end-to-end del pipeline y artefactos.
+- [x] Ejecutar el primer piloto tabular + temporal con comparación dense vs sparse.
 
 ## Tipos de sparsity
 
@@ -64,6 +66,8 @@ Montar en denograd-s un piloto reproducible que permita comprobar si DenoGrad me
 - Aun así, no hay que asumir speedup garantizado: la aceleración real depende de que la librería, el dtype y los kernels disponibles aprovechen el patrón 2:4.
 - En este proyecto, 2:4 se debe tratar como una hipótesis de eficiencia a validar empíricamente, no como una promesa de mejora automática.
 - Si la combinación concreta de GPU, PyTorch y torchao no activa kernels sparse, el experimento sigue siendo útil como comparación de calidad y memoria, aunque no como prueba de speedup de hardware.
+- Implementación actual: el método 2:4 del proyecto aplica primero la máscara 2:4 y después intenta conversión a representación semi-estructurada acelerable en módulos `Linear` elegibles, registrando en artefactos qué módulos quedaron realmente acelerados.
+- Requisitos prácticos para activar aceleración 2:4: GPU Ampere+, CUDA activa, capas lineales con `in_features` múltiplo de 4 y dtype compatible (`fp16` o `bf16`) en la ruta de ejecución relevante.
 
 ### 4. Fase 3 — Protocolo experimental y reglas de justicia
 

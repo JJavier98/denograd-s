@@ -9,6 +9,7 @@ This module provides:
 from __future__ import annotations
 
 import copy
+import warnings
 from typing import Any
 
 import torch
@@ -18,14 +19,22 @@ try:
 except ImportError:  # pragma: no cover - optional in some minimal torch builds
     torch_prune = None
 
+try:
+    from torch.sparse import to_sparse_semi_structured
+except ImportError:  # pragma: no cover - depends on torch build/version
+    to_sparse_semi_structured = None
+
 
 def _iter_target_parameters(model: torch.nn.Module, include_bias: bool = False):
     """Yield trainable floating-point parameters eligible for sparsification."""
     for name, parameter in model.named_parameters():
+        # Skip frozen parameters because they are not part of the optimization dynamics.
         if not parameter.requires_grad:
             continue
+        # Sparsity is only meaningful for numeric tensors where zeroing values is valid.
         if not (parameter.is_floating_point() or parameter.is_complex()):
             continue
+        # Bias can be optionally excluded to avoid degrading calibration-heavy layers.
         if (not include_bias) and name.endswith("bias"):
             continue
         yield name, parameter
@@ -33,6 +42,7 @@ def _iter_target_parameters(model: torch.nn.Module, include_bias: bool = False):
 
 def _global_abs_threshold(named_params: list[tuple[str, torch.nn.Parameter]], sparsity_ratio: float) -> tuple[torch.Tensor | None, int, int]:
     """Compute global absolute-value threshold for a target sparsity ratio."""
+    # Flatten all eligible tensors to compute one global cutoff across the whole model.
     flat_abs = torch.cat([param.detach().abs().reshape(-1) for _, param in named_params], dim=0)
     total = int(flat_abs.numel())
     if total == 0:
@@ -40,12 +50,14 @@ def _global_abs_threshold(named_params: list[tuple[str, torch.nn.Parameter]], sp
     k = int(total * sparsity_ratio)
     if k <= 0:
         return None, total, k
+    # kthvalue gives the magnitude threshold that approximates the requested global sparsity.
     threshold = torch.kthvalue(flat_abs, min(k, total)).values
     return threshold, total, k
 
 
 def _tensor_2to4_mask(tensor: torch.Tensor) -> torch.Tensor:
     """Build a binary 2:4 mask preserving two largest magnitudes per group of four values."""
+    # 2:4 requires grouping along a matrix-like axis; vectors are left untouched.
     if tensor.ndim < 2:
         return torch.ones_like(tensor, dtype=tensor.dtype)
 
@@ -58,6 +70,7 @@ def _tensor_2to4_mask(tensor: torch.Tensor) -> torch.Tensor:
         return mask
 
     with torch.no_grad():
+        # Build groups of 4 and keep exactly the two largest magnitudes per group.
         chunks = view[:, :usable].reshape(-1, 4)
         chunk_mask = torch.zeros_like(chunks, dtype=tensor.dtype)
         top2_idx = torch.topk(chunks.abs(), k=2, dim=1, largest=True, sorted=False).indices
@@ -65,6 +78,81 @@ def _tensor_2to4_mask(tensor: torch.Tensor) -> torch.Tensor:
         view_mask[:, :usable] = chunk_mask.reshape(view.shape[0], usable)
 
     return mask
+
+
+def _cuda_ampere_or_newer(device: torch.device | str | None) -> bool:
+    """Return True when CUDA device supports Ampere+ sparse Tensor Core kernels."""
+    if not torch.cuda.is_available():
+        return False
+
+    resolved = torch.device(device) if device is not None else torch.device("cuda")
+    if resolved.type != "cuda":
+        return False
+
+    index = resolved.index if resolved.index is not None else torch.cuda.current_device()
+    major, _minor = torch.cuda.get_device_capability(index)
+    return major >= 8
+
+
+def _linear_modules(model: torch.nn.Module):
+    """Yield named linear modules targeted by hardware 2:4 conversion."""
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.Linear):
+            yield name, module
+
+
+def _try_enable_hardware_2to4(
+    model: torch.nn.Module,
+    device: torch.device | str | None,
+) -> dict[str, Any]:
+    """Try converting eligible Linear weights to semi-structured tensors for acceleration."""
+    report = {
+        "requested": True,
+        "eligible_gpu": _cuda_ampere_or_newer(device),
+        "backend": "torch.sparse.to_sparse_semi_structured",
+        "converted_modules": [],
+        "skipped_modules": {},
+        "active": False,
+    }
+
+    if to_sparse_semi_structured is None:
+        report["active"] = False
+        report["reason"] = "semi_structured_api_unavailable"
+        return report
+
+    if not report["eligible_gpu"]:
+        report["active"] = False
+        report["reason"] = "gpu_not_ampere_or_cuda_unavailable"
+        return report
+
+    for module_name, module in _linear_modules(model):
+        weight = module.weight
+        if weight is None:
+            report["skipped_modules"][module_name] = "missing_weight"
+            continue
+
+        # Current sparse Tensor Core paths generally require fp16/bf16 and K dim multiple of 4.
+        if weight.dtype not in {torch.float16, torch.bfloat16}:
+            report["skipped_modules"][module_name] = "dtype_not_fp16_bf16"
+            continue
+        if weight.ndim != 2:
+            report["skipped_modules"][module_name] = "weight_not_2d"
+            continue
+        if (weight.shape[1] % 4) != 0:
+            report["skipped_modules"][module_name] = "in_features_not_multiple_of_4"
+            continue
+
+        try:
+            sparse_weight = to_sparse_semi_structured(weight)
+            module.weight = torch.nn.Parameter(sparse_weight, requires_grad=weight.requires_grad)
+            report["converted_modules"].append(module_name)
+        except (RuntimeError, TypeError, ValueError) as exc:
+            report["skipped_modules"][module_name] = f"conversion_failed: {exc}"
+
+    report["active"] = len(report["converted_modules"]) > 0
+    if not report["active"] and "reason" not in report:
+        report["reason"] = "no_eligible_linear_modules"
+    return report
 
 
 def apply_magnitude_sparsification(
@@ -77,6 +165,7 @@ def apply_magnitude_sparsification(
     if not 0.0 <= sparsity_ratio <= 1.0:
         raise ValueError("sparsity_ratio must be in [0, 1].")
 
+    # Work on a copy by default so callers can compare dense vs sparse safely.
     target_model = model if inplace else copy.deepcopy(model)
     named_params = list(_iter_target_parameters(target_model, include_bias=include_bias))
     if not named_params:
@@ -88,6 +177,7 @@ def apply_magnitude_sparsification(
         }
 
     with torch.no_grad():
+        # Global ranking across all selected tensors.
         flat_abs = torch.cat([param.detach().abs().reshape(-1) for _, param in named_params], dim=0)
         total = int(flat_abs.numel())
         k = int(total * sparsity_ratio)
@@ -109,6 +199,7 @@ def apply_magnitude_sparsification(
 
         threshold = torch.kthvalue(flat_abs, min(k, total)).values
         for _, parameter in named_params:
+            # Keep values above threshold; zero out smallest magnitudes.
             mask = parameter.detach().abs() > threshold
             parameter.mul_(mask)
 
@@ -141,6 +232,7 @@ def apply_structured_sparsification(
     if not 0.0 <= sparsity_ratio <= 1.0:
         raise ValueError("sparsity_ratio must be in [0, 1].")
 
+    # Clone unless explicitly requested in-place to keep experiment branches isolated.
     target_model = model if inplace else copy.deepcopy(model)
     pruned_modules: list[str] = []
 
@@ -150,7 +242,9 @@ def apply_structured_sparsification(
         if not hasattr(module, "weight"):
             continue
 
+        # Remove full structural units (channels/neurons) instead of individual weights.
         torch_prune.ln_structured(module, name="weight", amount=sparsity_ratio, n=2, dim=dim)
+        # Make pruning permanent by removing reparameterization wrappers.
         torch_prune.remove(module, "weight")
         pruned_modules.append(module_name)
 
@@ -174,9 +268,12 @@ def apply_structured_sparsification(
 def apply_semi_structured_2to4_sparsification(
     model: torch.nn.Module,
     include_bias: bool = False,
+    device: torch.device | str | None = None,
+    enable_hardware_acceleration: bool = True,
     inplace: bool = False,
 ) -> tuple[torch.nn.Module, dict[str, Any]]:
     """Apply a 2:4 semi-structured mask on eligible tensors (ndim >= 2)."""
+    # Keep dense branch untouched unless in-place behavior is explicitly requested.
     target_model = model if inplace else copy.deepcopy(model)
     touched = 0
 
@@ -184,9 +281,24 @@ def apply_semi_structured_2to4_sparsification(
         for _, parameter in _iter_target_parameters(target_model, include_bias=include_bias):
             if parameter.ndim < 2:
                 continue
+            # Enforce 2 non-zeros per 4 values on each eligible row-like block.
             mask = _tensor_2to4_mask(parameter)
             parameter.mul_(mask)
             touched += 1
+
+    acceleration = {
+        "requested": bool(enable_hardware_acceleration),
+        "active": False,
+        "reason": "disabled_by_config",
+    }
+    if enable_hardware_acceleration:
+        acceleration = _try_enable_hardware_2to4(target_model, device=device)
+        if not acceleration.get("active", False):
+            warnings.warn(
+                "2:4 mask applied but no hardware-accelerated semi-structured backend is active. "
+                "This run may not show kernel-level speedups.",
+                RuntimeWarning,
+            )
 
     stats = summarize_sparsity(target_model, include_bias=include_bias)
     stats.update(
@@ -195,6 +307,7 @@ def apply_semi_structured_2to4_sparsification(
             "requested_sparsity": 0.5,
             "applied": touched > 0,
             "touched_tensors": touched,
+            "hardware_acceleration": acceleration,
         }
     )
     return target_model, stats
@@ -202,6 +315,7 @@ def apply_semi_structured_2to4_sparsification(
 
 def summarize_sparsity(model: torch.nn.Module, include_bias: bool = False) -> dict[str, Any]:
     """Summarize non-zero statistics over eligible parameters."""
+    # Use the same eligibility rule as pruning so metrics are comparable.
     params = [param.detach() for _, param in _iter_target_parameters(model, include_bias=include_bias)]
     if not params:
         return {
@@ -265,6 +379,7 @@ class GradualMagnitudeController(TrainingSparsityController):
         self._current_sparsity = 0.0
 
     def _scheduled_sparsity(self, epoch: int, max_epochs: int) -> float:
+        # Default end epoch is near the end of training if user does not set one.
         end = self.end_epoch if self.end_epoch is not None else max(self.start_epoch + 1, max_epochs - 1)
         if epoch <= self.start_epoch:
             return 0.0
@@ -281,6 +396,7 @@ class GradualMagnitudeController(TrainingSparsityController):
         if not named_params:
             return
 
+        # Recompute a fresh global threshold each epoch to follow the schedule.
         threshold, total, _ = _global_abs_threshold(named_params, sparsity)
         self._mask_by_name = {}
 
@@ -290,6 +406,7 @@ class GradualMagnitudeController(TrainingSparsityController):
                     mask = torch.ones_like(parameter)
                 else:
                     mask = (parameter.detach().abs() > threshold).to(parameter.dtype)
+                # Apply and store masks so zeros remain zero after optimizer steps.
                 parameter.mul_(mask)
                 self._mask_by_name[name] = mask
 
@@ -341,6 +458,7 @@ class SparseFromScratchController(TrainingSparsityController):
         self._initialized = False
 
     def _build_masks(self, model: torch.nn.Module) -> None:
+        # Masks are built once and then kept fixed for the whole training run.
         named_params = list(_iter_target_parameters(model, include_bias=self.include_bias))
         if not named_params:
             return
@@ -355,6 +473,7 @@ class SparseFromScratchController(TrainingSparsityController):
                         mask = (parameter.detach().abs() > threshold).to(parameter.dtype)
                     self._mask_by_name[name] = mask
         else:
+            # Random fixed topology: choose surviving weights with Bernoulli sampling.
             generator = torch.Generator(device=named_params[0][1].device)
             generator.manual_seed(self.seed)
             keep_prob = 1.0 - self.sparsity_ratio
@@ -423,6 +542,7 @@ def apply_post_training_sparsification(
     inplace: bool = False,
 ) -> tuple[torch.nn.Module, dict[str, Any]]:
     """Dispatch post-training sparsification methods."""
+    # Central dispatcher used by runners to keep method selection uniform.
     normalized = method.lower()
     ratio = float(config.get("ratio", 0.5))
     include_bias = bool(config.get("include_bias", False))
@@ -446,6 +566,8 @@ def apply_post_training_sparsification(
         return apply_semi_structured_2to4_sparsification(
             model=model,
             include_bias=include_bias,
+            device=config.get("device"),
+            enable_hardware_acceleration=bool(config.get("enable_hardware_acceleration", True)),
             inplace=inplace,
         )
 

@@ -1,7 +1,9 @@
 """End-to-end experiment runners with caching, checkpoints and denoising profiling."""
 
 import copy
+import re
 import time
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -66,6 +68,71 @@ def _build_signature_payload(config, domain):
         "seed": config.get("seed", 42),
         "version": config.get("version", "v1"),
     }
+
+
+def _slugify(value):
+    """Create filesystem-friendly labels for experiment paths."""
+    text = str(value or "na").strip().lower()
+    text = re.sub(r"[^a-z0-9]+", "_", text)
+    text = re.sub(r"_+", "_", text).strip("_")
+    return text or "na"
+
+
+def _dataset_label(dataset_cfg):
+    """Extract a compact dataset label from dataset path if available."""
+    path = dataset_cfg.get("path") if dataset_cfg else None
+    if not path:
+        return "dataset_unknown"
+    path_obj = Path(path)
+    parent = _slugify(path_obj.parent.name)
+    stem = _slugify(path_obj.stem)
+    return f"{parent}_{stem}"
+
+
+def _sparsity_label(sparsity_cfg):
+    """Build readable label for sparse setting used in the run."""
+    cfg = sparsity_cfg or {}
+    if not cfg.get("enabled", False):
+        return "dense"
+    method = _slugify(cfg.get("method", "unknown"))
+    ratio = str(cfg.get("ratio", "na")).replace(".", "p")
+    return f"{method}_{ratio}"
+
+
+def _build_artifacts_base_dir(config, domain):
+    """Compose human-readable base path under artifacts root before signature folder."""
+    root = Path(config.get("artifacts_dir", "out"))
+    dataset_cfg = _as_dict(config.get("dataset", {}))
+    model_cfg = _as_dict(config.get("model", {}))
+    sparsity_cfg = _as_dict(config.get("sparsity", {}))
+
+    domain_dir = "time_series" if domain == "time_series" else "tabular"
+    dataset = _dataset_label(dataset_cfg)
+    model = _slugify(model_cfg.get("name", "model"))
+    sparse = _sparsity_label(sparsity_cfg)
+    seed = config.get("seed", 42)
+    version = _slugify(config.get("version", "v1"))
+
+    run_label = f"{dataset}__{model}__{sparse}__seed{seed}__{version}"
+    return root / domain_dir / run_label
+
+
+def _store_run_context(artifact_cache, payload, config):
+    """Persist run metadata for easier traceability across hash folders."""
+    run_context = {
+        "signature": artifact_cache.signature,
+        "payload": payload,
+        "dataset_path": _as_dict(config.get("dataset", {})).get("path"),
+        "model_name": _as_dict(config.get("model", {})).get("name"),
+        "sparsity": _as_dict(config.get("sparsity", {})),
+        "seed": config.get("seed", 42),
+        "version": config.get("version", "v1"),
+    }
+    artifact_cache.save_json(run_context, "run_context", kind="logs")
+    artifact_cache.update_manifest(
+        "run_context",
+        {"path": str(artifact_cache.json_path("run_context", kind="logs"))},
+    )
 
 
 def _load_or_prepare_tabular_data(config, artifact_cache):
@@ -210,7 +277,9 @@ def run_tabular_experiment(config):
     device = _device_from_config(config)
     payload = _build_signature_payload(config, domain="tabular")
     signature = make_experiment_signature(payload)
-    artifact_cache = ExperimentCache(base_dir=config.get("artifacts_dir", "artifacts"), signature=signature)
+    base_dir = _build_artifacts_base_dir(config, domain="tabular")
+    artifact_cache = ExperimentCache(base_dir=str(base_dir), signature=signature)
+    _store_run_context(artifact_cache, payload, config)
 
     _X_clean, _y_clean, X_noisy, y_noisy = _load_or_prepare_tabular_data(config, artifact_cache)
 
@@ -327,6 +396,8 @@ def run_tabular_experiment(config):
         return_metadata=True,
     )
 
+    dense_evaluation = evaluate_changes(X_noisy, X_denoised, results_noisy, results_clean)
+
     summary = {
         "signature": signature,
         "device": str(device),
@@ -335,7 +406,7 @@ def run_tabular_experiment(config):
         "denoising_profile": denoise_metrics,
         "benchmark_noisy_profile": noisy_meta,
         "benchmark_clean_profile": clean_meta,
-        "evaluation": evaluate_changes(X_noisy, X_denoised, results_noisy, results_clean),
+        "evaluation": dense_evaluation,
         "weight_analysis": {
             "dense": {
                 "stats": dense_weight_stats,
@@ -343,6 +414,12 @@ def run_tabular_experiment(config):
             }
         },
     }
+
+    artifact_cache.save_json(dense_evaluation, "evaluation_dense", kind="metrics")
+    artifact_cache.update_manifest(
+        "evaluation_dense",
+        {"path": str(artifact_cache.json_path("evaluation_dense", kind="metrics"))},
+    )
 
     if sparsity_cfg.get("enabled", False):
         sparse_method = _normalize_sparse_method(sparsity_cfg.get("method", "magnitude_unstructured"))
@@ -399,10 +476,12 @@ def run_tabular_experiment(config):
                 }
             else:
                 sparse_backbone = copy.deepcopy(backbone)
+                post_cfg = dict(sparsity_cfg)
+                post_cfg.setdefault("device", str(device))
                 sparse_backbone, sparse_report = apply_post_training_sparsification(
                     model=sparse_backbone,
                     method=sparse_method,
-                    config=sparsity_cfg,
+                    config=post_cfg,
                     inplace=True,
                 )
 
@@ -469,6 +548,13 @@ def run_tabular_experiment(config):
             return_metadata=True,
         )
 
+        sparse_evaluation = evaluate_changes(
+            X_noisy,
+            X_denoised_sparse,
+            results_noisy,
+            sparse_results_clean,
+        )
+
         summary["sparse"] = {
             "method": sparse_method,
             "ratio": sparse_ratio,
@@ -476,17 +562,22 @@ def run_tabular_experiment(config):
             "results_clean": sparse_results_clean,
             "denoising_profile": sparse_denoise_metrics,
             "benchmark_clean_profile": sparse_clean_meta,
-            "evaluation": evaluate_changes(
-                X_noisy,
-                X_denoised_sparse,
-                results_noisy,
-                sparse_results_clean,
-            ),
+            "evaluation": sparse_evaluation,
         }
         summary["weight_analysis"]["sparse"] = {
             "stats": sparse_weight_stats,
             "histogram_figure": sparse_weight_fig,
         }
+        artifact_cache.save_json(sparse_evaluation, "evaluation_sparse", kind="metrics")
+        artifact_cache.save_json(summary["sparse"], "sparse_summary", kind="metrics")
+        artifact_cache.update_manifest(
+            "evaluation_sparse",
+            {"path": str(artifact_cache.json_path("evaluation_sparse", kind="metrics"))},
+        )
+        artifact_cache.update_manifest(
+            "sparse_summary",
+            {"path": str(artifact_cache.json_path("sparse_summary", kind="metrics"))},
+        )
 
     artifact_cache.save_json(summary, "summary_tabular", kind="metrics")
     artifact_cache.update_manifest(
@@ -502,7 +593,9 @@ def run_ts_experiment(config):
     device = _device_from_config(config)
     payload = _build_signature_payload(config, domain="time_series")
     signature = make_experiment_signature(payload)
-    artifact_cache = ExperimentCache(base_dir=config.get("artifacts_dir", "artifacts"), signature=signature)
+    base_dir = _build_artifacts_base_dir(config, domain="time_series")
+    artifact_cache = ExperimentCache(base_dir=str(base_dir), signature=signature)
+    _store_run_context(artifact_cache, payload, config)
 
     _X_clean, _y_clean, X_noisy, y_noisy = _load_or_prepare_ts_data(config, artifact_cache)
 
@@ -640,6 +733,8 @@ def run_ts_experiment(config):
         return_metadata=True,
     )
 
+    dense_evaluation = evaluate_changes(X_noisy, X_denoised, results_noisy, results_clean)
+
     summary = {
         "signature": signature,
         "device": str(device),
@@ -648,7 +743,7 @@ def run_ts_experiment(config):
         "denoising_profile": denoise_metrics,
         "benchmark_noisy_profile": noisy_meta,
         "benchmark_clean_profile": clean_meta,
-        "evaluation": evaluate_changes(X_noisy, X_denoised, results_noisy, results_clean),
+        "evaluation": dense_evaluation,
         "weight_analysis": {
             "dense": {
                 "stats": dense_weight_stats,
@@ -656,6 +751,12 @@ def run_ts_experiment(config):
             }
         },
     }
+
+    artifact_cache.save_json(dense_evaluation, "evaluation_dense", kind="metrics")
+    artifact_cache.update_manifest(
+        "evaluation_dense",
+        {"path": str(artifact_cache.json_path("evaluation_dense", kind="metrics"))},
+    )
 
     if sparsity_cfg.get("enabled", False):
         sparse_method = _normalize_sparse_method(sparsity_cfg.get("method", "magnitude_unstructured"))
@@ -724,10 +825,12 @@ def run_ts_experiment(config):
                 }
             else:
                 sparse_backbone = copy.deepcopy(backbone)
+                post_cfg = dict(sparsity_cfg)
+                post_cfg.setdefault("device", str(device))
                 sparse_backbone, sparse_report = apply_post_training_sparsification(
                     model=sparse_backbone,
                     method=sparse_method,
-                    config=sparsity_cfg,
+                    config=post_cfg,
                     inplace=True,
                 )
 
@@ -803,6 +906,13 @@ def run_ts_experiment(config):
             return_metadata=True,
         )
 
+        sparse_evaluation = evaluate_changes(
+            X_noisy,
+            X_denoised_sparse,
+            results_noisy,
+            sparse_results_clean,
+        )
+
         summary["sparse"] = {
             "method": sparse_method,
             "ratio": sparse_ratio,
@@ -810,17 +920,22 @@ def run_ts_experiment(config):
             "results_clean": sparse_results_clean,
             "denoising_profile": sparse_denoise_metrics,
             "benchmark_clean_profile": sparse_clean_meta,
-            "evaluation": evaluate_changes(
-                X_noisy,
-                X_denoised_sparse,
-                results_noisy,
-                sparse_results_clean,
-            ),
+            "evaluation": sparse_evaluation,
         }
         summary["weight_analysis"]["sparse"] = {
             "stats": sparse_weight_stats,
             "histogram_figure": sparse_weight_fig,
         }
+        artifact_cache.save_json(sparse_evaluation, "evaluation_sparse", kind="metrics")
+        artifact_cache.save_json(summary["sparse"], "sparse_summary", kind="metrics")
+        artifact_cache.update_manifest(
+            "evaluation_sparse",
+            {"path": str(artifact_cache.json_path("evaluation_sparse", kind="metrics"))},
+        )
+        artifact_cache.update_manifest(
+            "sparse_summary",
+            {"path": str(artifact_cache.json_path("sparse_summary", kind="metrics"))},
+        )
 
     artifact_cache.save_json(summary, "summary_ts", kind="metrics")
     artifact_cache.update_manifest(

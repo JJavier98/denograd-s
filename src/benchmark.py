@@ -7,9 +7,22 @@ from sklearn.neighbors import KNeighborsRegressor
 from sklearn.metrics import mean_squared_error
 import torch
 import torch.nn as nn
-from xgboost import XGBRegressor
-from tabpfn import TabPFNRegressor
-from TSFEDL import OhShuLih, OhShuLih_Forecaster
+
+try:
+    from xgboost import XGBRegressor
+except ImportError:  # pragma: no cover - optional dependency
+    XGBRegressor = None
+
+try:
+    from tabpfn import TabPFNRegressor
+except ImportError:  # pragma: no cover - optional dependency
+    TabPFNRegressor = None
+
+try:
+    from TSFEDL import OhShuLih, OhShuLih_Forecaster
+except ImportError:  # pragma: no cover - optional dependency
+    OhShuLih = None
+    OhShuLih_Forecaster = None
 from src.models.dnn import TabularDNN
 from src.models.lstm import MultivariateLSTM
 from src.models.xlstm_adapter import xLSTMAdapter
@@ -74,6 +87,9 @@ def run_regression_benchmark(
     if benchmark_cfg is not None and hasattr(benchmark_cfg, 'keys'):
         benchmark_cfg = dict(benchmark_cfg)
 
+    def _enabled(params):
+        return bool(params.get("enabled", True)) if isinstance(params, dict) else True
+
     X_train = X_train_tensor.cpu().numpy()
     y_train = y_train_tensor.cpu().numpy()
     # X_val = X_val_tensor.cpu().numpy()
@@ -85,7 +101,7 @@ def run_regression_benchmark(
     print("  -> Training Ridge...")
     t0 = time.perf_counter()
     ridge_params = benchmark_cfg.get("ridge", {}) if benchmark_cfg else {}
-    ridge = Ridge(**ridge_params)
+    ridge = Ridge(**{k: v for k, v in ridge_params.items() if k != "enabled"})
     ridge.fit(X_train, y_train)
     y_pred_ridge = ridge.predict(X_test)
     results['Ridge'] = mean_squared_error(y_test, y_pred_ridge)
@@ -96,7 +112,7 @@ def run_regression_benchmark(
     print("  -> Training KNN...")
     t0 = time.perf_counter()
     knn_params = benchmark_cfg.get("knn", {}) if benchmark_cfg else {}
-    knn = KNeighborsRegressor(**knn_params)
+    knn = KNeighborsRegressor(**{k: v for k, v in knn_params.items() if k != "enabled"})
     knn.fit(X_train, y_train)
     y_pred_knn = knn.predict(X_test)
     results['KNN'] = mean_squared_error(y_test, y_pred_knn)
@@ -104,51 +120,65 @@ def run_regression_benchmark(
     del knn; gc.collect()
 
     # 3. XGBoost
-    print("  -> Training XGBoost...")
-    t0 = time.perf_counter()
     xgb_params = benchmark_cfg.get("xgboost", {}) if benchmark_cfg else {}
-    xgb = XGBRegressor(**xgb_params)
-    xgb.fit(X_train, y_train)
-    y_pred_xgb = xgb.predict(X_test)
-    results['XGBoost'] = mean_squared_error(y_test, y_pred_xgb)
-    metadata["timings_seconds"]["XGBoost"] = time.perf_counter() - t0
-    del xgb; gc.collect()
+    if _enabled(xgb_params):
+        print("  -> Training XGBoost...")
+        t0 = time.perf_counter()
+        if XGBRegressor is None:
+            results['XGBoost'] = float('inf')
+            metadata["timings_seconds"]["XGBoost"] = 0.0
+            metadata["inference_profile"]["XGBoost"] = {"error": "xgboost_not_installed"}
+        else:
+            xgb = XGBRegressor(**{k: v for k, v in xgb_params.items() if k != "enabled"})
+            xgb.fit(X_train, y_train)
+            y_pred_xgb = xgb.predict(X_test)
+            results['XGBoost'] = mean_squared_error(y_test, y_pred_xgb)
+            metadata["timings_seconds"]["XGBoost"] = time.perf_counter() - t0
+            del xgb
+        gc.collect()
 
     # 4. TabPFN
     # TabPFN uses O(n²) attention — subsample for large datasets to avoid RAM OOM
     TABPFN_MAX_SAMPLES = 3_000
-    print("  -> Training TabPFN...")
-    t0 = time.perf_counter()
     tabpfn_params = benchmark_cfg.get("tabpfn", {}) if benchmark_cfg else {}
+    if _enabled(tabpfn_params):
+        print("  -> Training TabPFN...")
+        t0 = time.perf_counter()
+        if TabPFNRegressor is None:
+            results['TabPFN'] = float('inf')
+            metadata["timings_seconds"]["TabPFN"] = 0.0
+            metadata["inference_profile"]["TabPFN"] = {"error": "tabpfn_not_installed"}
+        else:
+            # Ensure ignore_pretraining_limits is set to True to handle large datasets
+            if hasattr(tabpfn_params, 'items'):
+                tabpfn_params = dict(tabpfn_params)
+            tabpfn_params = {k: v for k, v in tabpfn_params.items() if k != "enabled"}
+            tabpfn_params.setdefault('ignore_pretraining_limits', True)
+            # Force CPU to avoid CUDA OOM with large datasets
+            tabpfn_params['device'] = 'cpu'
+            # Limit estimators to reduce RAM usage
+            tabpfn_params['n_estimators'] = 1
 
-    # Ensure ignore_pretraining_limits is set to True to handle large datasets
-    if hasattr(tabpfn_params, 'items'):
-        tabpfn_params = dict(tabpfn_params)
-    tabpfn_params.setdefault('ignore_pretraining_limits', True)
-    # Force CPU to avoid CUDA OOM with large datasets
-    tabpfn_params['device'] = 'cpu'
-    # Limit estimators to reduce RAM usage
-    tabpfn_params['n_estimators'] = 1
+            # TabPFN expects 1D y for regression usually, or single output
+            y_train_tpfn = y_train.ravel() if y_train.ndim > 1 and y_train.shape[1] == 1 else y_train
 
-    # TabPFN expects 1D y for regression usually, or single output
-    y_train_tpfn = y_train.ravel() if y_train.ndim > 1 and y_train.shape[1] == 1 else y_train
+            # Subsample training data if too large for TabPFN
+            if len(X_train) > TABPFN_MAX_SAMPLES:
+                print(f"     (Subsampling {TABPFN_MAX_SAMPLES}/{len(X_train)} samples for TabPFN)")
+                rng = np.random.default_rng(42)
+                idx = rng.choice(len(X_train), TABPFN_MAX_SAMPLES, replace=False)
+                X_train_tpfn = X_train[idx]
+                y_train_tpfn = y_train_tpfn[idx]
+            else:
+                X_train_tpfn = X_train
 
-    # Subsample training data if too large for TabPFN
-    if len(X_train) > TABPFN_MAX_SAMPLES:
-        print(f"     (Subsampling {TABPFN_MAX_SAMPLES}/{len(X_train)} samples for TabPFN)")
-        rng = np.random.RandomState(42)
-        idx = rng.choice(len(X_train), TABPFN_MAX_SAMPLES, replace=False)
-        X_train_tpfn = X_train[idx]
-        y_train_tpfn = y_train_tpfn[idx]
-    else:
-        X_train_tpfn = X_train
-
-    tpfn = TabPFNRegressor(**tabpfn_params)
-    tpfn.fit(X_train_tpfn, y_train_tpfn)
-    y_pred_tpfn = tpfn.predict(X_test)
-    results['TabPFN'] = mean_squared_error(y_test, y_pred_tpfn)
-    metadata["timings_seconds"]["TabPFN"] = time.perf_counter() - t0
-    del tpfn, X_train_tpfn, y_train_tpfn; gc.collect()
+            tpfn = TabPFNRegressor(**tabpfn_params)
+            tpfn.fit(X_train_tpfn, y_train_tpfn)
+            y_pred_tpfn = tpfn.predict(X_test)
+            results['TabPFN'] = mean_squared_error(y_test, y_pred_tpfn)
+            metadata["timings_seconds"]["TabPFN"] = time.perf_counter() - t0
+            del tpfn, X_train_tpfn, y_train_tpfn
+        gc.collect()
 
     # 5. DNN
     print("  -> Training DNN...")
@@ -295,11 +325,14 @@ def run_ts_benchmark(
     else:
         benchmark_cfg = {}
 
+    def _enabled(params):
+        return bool(params.get("enabled", True)) if isinstance(params, dict) else True
+
     # 1. Ridge
     print("  -> Training Ridge (Flattened)...")
     t0 = time.perf_counter()
     ridge_params = benchmark_cfg.get("ridge", {})
-    ridge = Ridge(**ridge_params)
+    ridge = Ridge(**{k: v for k, v in ridge_params.items() if k != "enabled"})
     ridge.fit(X_train_flat, y_train_flat)
     y_pred_ridge = ridge.predict(X_test_flat)
     results['Ridge'] = mean_squared_error(y_test_flat, y_pred_ridge)
@@ -309,21 +342,27 @@ def run_ts_benchmark(
     print("  -> Training KNN (Flattened)...")
     t0 = time.perf_counter()
     knn_params = benchmark_cfg.get("knn", {})
-    knn = KNeighborsRegressor(**knn_params)
+    knn = KNeighborsRegressor(**{k: v for k, v in knn_params.items() if k != "enabled"})
     knn.fit(X_train_flat, y_train_flat)
     y_pred_knn = knn.predict(X_test_flat)
     results['KNN'] = mean_squared_error(y_test_flat, y_pred_knn)
     metadata["timings_seconds"]["KNN"] = time.perf_counter() - t0
 
     # 3. XGBoost
-    print("  -> Training XGBoost (Flattened)...")
-    t0 = time.perf_counter()
     xgb_params = benchmark_cfg.get("xgboost", {})
-    xgb = XGBRegressor(**xgb_params)
-    xgb.fit(X_train_flat, y_train_flat)
-    y_pred_xgb = xgb.predict(X_test_flat)
-    results['XGBoost'] = mean_squared_error(y_test_flat, y_pred_xgb)
-    metadata["timings_seconds"]["XGBoost"] = time.perf_counter() - t0
+    if _enabled(xgb_params):
+        print("  -> Training XGBoost (Flattened)...")
+        t0 = time.perf_counter()
+        if XGBRegressor is None:
+            results['XGBoost'] = float('inf')
+            metadata["timings_seconds"]["XGBoost"] = 0.0
+            metadata["inference_profile"]["XGBoost"] = {"error": "xgboost_not_installed"}
+        else:
+            xgb = XGBRegressor(**{k: v for k, v in xgb_params.items() if k != "enabled"})
+            xgb.fit(X_train_flat, y_train_flat)
+            y_pred_xgb = xgb.predict(X_test_flat)
+            results['XGBoost'] = mean_squared_error(y_test_flat, y_pred_xgb)
+            metadata["timings_seconds"]["XGBoost"] = time.perf_counter() - t0
 
     # 4. DNN (Flattened)
     print("  -> Training DNN (Flattened)...")
@@ -570,74 +609,75 @@ def run_ts_benchmark(
         metadata["inference_profile"]["xLSTM"] = {"error": str(e)}
 
     # 7. OhShuLih (TSFEDL)
-    print("  -> Training OhShuLih (TSFEDL)...")
-    t0 = time.perf_counter()
     oh_params = benchmark_cfg.get("ohshulih", {})
 
-    try:
-        # Replace top_module
-        top_module = OhShuLih_Forecaster(
-            out_features=output_dim_seq,
-            n_pred=pred_len
-        )
-
-        # Instantiate base model
-        model_oh = OhShuLih(
-            in_features=input_dim_seq,
-            top_module=top_module,
-            loss=criterion,
-            dropout=oh_params.get("dropout", 0.1)
-        )
-
-        model_oh_adapted = PermuteAndRun(model_oh).to(device)
-
-        # Use Trainer
-        optimizer_oh = torch.optim.Adam(model_oh_adapted.parameters(), lr=lr)
-
-        trainer_oh = Trainer(
-            model=model_oh_adapted,
-            train_generator=train_loader_seq,
-            val_generator=val_loader_seq,
-            device=device,
-            criterion=criterion,
-            optimizer=optimizer_oh,
-            epoch_scheduler=None,
-            batch_scheduler=None,
-            patience=patience,
-            epochs=max_epochs,
-            checkpoints_path="checkpoints/ohshulih_ts_benchmark.pth"
-        )
-
-        best_oh, _, _, _, _ = trainer_oh.fit()
-        best_oh.eval()
-        with torch.no_grad():
-            y_pred_oh = best_oh(X_test.float().to(device)).cpu().numpy()
-
-        if y_pred_oh.ndim != y_test_flat.ndim:
-            y_pred_oh = y_pred_oh.reshape(y_test_flat.shape)
-
-        results['OhShuLih'] = mean_squared_error(y_test_flat, y_pred_oh)
-        metadata["timings_seconds"]["OhShuLih"] = time.perf_counter() - t0
-        metadata["model_stats"]["OhShuLih"] = model_size_bytes(best_oh)
-
-        if profile_models:
+    if _enabled(oh_params):
+        print("  -> Training OhShuLih (TSFEDL)...")
+        t0 = time.perf_counter()
+        if OhShuLih is None or OhShuLih_Forecaster is None:
+            results['OhShuLih'] = float('inf')
+            metadata["timings_seconds"]["OhShuLih"] = 0.0
+            metadata["inference_profile"]["OhShuLih"] = {"error": "tsfedl_not_installed"}
+        else:
             try:
-                example_batch = X_test[: min(64, X_test.size(0))].float()
-                metadata["inference_profile"]["OhShuLih"] = benchmark_inference(
-                    best_oh,
-                    example_batch,
-                    device=device,
-                    warmup_runs=2,
-                    timed_runs=5,
+                top_module = OhShuLih_Forecaster(
+                    out_features=output_dim_seq,
+                    n_pred=pred_len,
                 )
-            except (RuntimeError, ValueError, AttributeError) as e:
-                metadata["inference_profile"]["OhShuLih"] = {"error": str(e)}
 
-    except (RuntimeError, ValueError, AttributeError) as e:
-        print(f"    [Warning] OhShuLih failed: {e}")
-        results['OhShuLih'] = float('inf')
-        metadata["timings_seconds"]["OhShuLih"] = time.perf_counter() - t0
-        metadata["inference_profile"]["OhShuLih"] = {"error": str(e)}
+                model_oh = OhShuLih(
+                    in_features=input_dim_seq,
+                    top_module=top_module,
+                    loss=criterion,
+                    dropout=oh_params.get("dropout", 0.1),
+                )
+                model_oh_adapted = PermuteAndRun(model_oh).to(device)
+                optimizer_oh = torch.optim.Adam(model_oh_adapted.parameters(), lr=lr)
+
+                trainer_oh = Trainer(
+                    model=model_oh_adapted,
+                    train_generator=train_loader_seq,
+                    val_generator=val_loader_seq,
+                    device=device,
+                    criterion=criterion,
+                    optimizer=optimizer_oh,
+                    epoch_scheduler=None,
+                    batch_scheduler=None,
+                    patience=patience,
+                    epochs=max_epochs,
+                    checkpoints_path="checkpoints/ohshulih_ts_benchmark.pth",
+                )
+
+                best_oh, _, _, _, _ = trainer_oh.fit()
+                best_oh.eval()
+                with torch.no_grad():
+                    y_pred_oh = best_oh(X_test.float().to(device)).cpu().numpy()
+
+                if y_pred_oh.ndim != y_test_flat.ndim:
+                    y_pred_oh = y_pred_oh.reshape(y_test_flat.shape)
+
+                results['OhShuLih'] = mean_squared_error(y_test_flat, y_pred_oh)
+                metadata["timings_seconds"]["OhShuLih"] = time.perf_counter() - t0
+                metadata["model_stats"]["OhShuLih"] = model_size_bytes(best_oh)
+
+                if profile_models:
+                    try:
+                        example_batch = X_test[: min(64, X_test.size(0))].float()
+                        metadata["inference_profile"]["OhShuLih"] = benchmark_inference(
+                            best_oh,
+                            example_batch,
+                            device=device,
+                            warmup_runs=2,
+                            timed_runs=5,
+                        )
+                    except (RuntimeError, ValueError, AttributeError) as e:
+                        metadata["inference_profile"]["OhShuLih"] = {"error": str(e)}
+
+            except (RuntimeError, ValueError, AttributeError) as e:
+                print(f"    [Warning] OhShuLih failed: {e}")
+                results['OhShuLih'] = float('inf')
+                metadata["timings_seconds"]["OhShuLih"] = time.perf_counter() - t0
+                metadata["inference_profile"]["OhShuLih"] = {"error": str(e)}
 
     # 8. DLinear
     print("  -> Training DLinear...")

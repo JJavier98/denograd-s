@@ -73,8 +73,22 @@ def load_data(data_path, target_col="y"):
     if missing_cols:
         raise ValueError(f"Target columns {missing_cols} not found in dataset.")
 
-    X = df.drop(columns=target_cols).values
-    y = df[target_cols].values
+    # Keep only numeric features to avoid failures with date/string columns.
+    features_df = df.drop(columns=target_cols).select_dtypes(include=[np.number]).copy()
+    if features_df.shape[1] == 0:
+        raise ValueError("No numeric feature columns available after preprocessing.")
+
+    # Targets are coerced to numeric when possible.
+    targets_df = df[target_cols].apply(pd.to_numeric, errors="coerce")
+
+    # Remove rows with invalid targets and impute feature NaNs with column medians.
+    valid_rows = ~targets_df.isna().any(axis=1)
+    features_df = features_df.loc[valid_rows]
+    targets_df = targets_df.loc[valid_rows]
+    features_df = features_df.fillna(features_df.median(numeric_only=True))
+
+    X = features_df.values
+    y = targets_df.values
     return X, y
 
 
