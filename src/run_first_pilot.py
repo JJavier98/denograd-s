@@ -6,7 +6,7 @@ import argparse
 import json
 from pathlib import Path
 
-from src.experiment_runner import run_tabular_experiment, run_ts_experiment
+from src.libs.experiment_runner import run_tabular_experiment, run_ts_experiment
 
 
 def _base_sparse_cfg(method: str, ratio: float, seed: int) -> dict:
@@ -152,7 +152,7 @@ def main() -> None:
             summary = run_ts_experiment(cfg)
         results.append({"domain": domain, "name": name, "seed": cfg["seed"], "summary": summary})
 
-    out = Path("out") / "pilot_runs"
+    out = Path("out") / "meta" / "summaries"
     out.mkdir(parents=True, exist_ok=True)
     summary_path = out / "first_pilot_summary.json"
     summary_path.write_text(json.dumps(results, indent=2), encoding="utf-8")

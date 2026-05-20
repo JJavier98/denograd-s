@@ -1,243 +1,262 @@
-# Plan: DenoGrad + Sparsity Pilot
+# Plan Canónico: DenoGrad + Energy Sparse + Transformers
 
-Montar en denograd-s un piloto reproducible que permita comprobar si DenoGrad mejora más cuando el backbone es sparse que cuando es denso. La comparación principal debe aislar el efecto del backbone sparse sobre el denoising, manteniendo fijo el benchmark downstream. La recomendación técnica es híbrida: masking con PyTorch/torch.ao para baseline y sparse-from-scratch, Torch-Pruning para pruning estructural, y torchao solo para 2:4 o block sparsity cuando haya soporte real de hardware.
+Este es el plan de referencia vigente del repositorio. Sustituye y absorbe los planes anteriores de piloto sparse y de poda híbrida on-training. Solo se conservan aquí las restricciones, parámetros operativos y decisiones que siguen siendo útiles para el estudio actual; los hitos históricos y estados antiguos quedan descartados como guía de ejecución.
 
-## Seguimiento
+## Objetivo
 
-- [x] Definir el plan experimental y el alcance del piloto.
-- [x] Añadir una política explícita de VRAM, tamaño de backbone y tiempo del proceso de denoising como métricas clave.
-- [x] Añadir una política explícita de caché y reutilización de artefactos.
-- [x] Crear la base ejecutable de soporte en `src/`: `Trainer`, `utils`, `evaluation` y caché/artefactos.
-- [x] Conectar `src/benchmark.py` con guardado opcional de resultados en caché.
-- [x] Añadir metadatos opcionales de tiempo/memoria en benchmark y manifiesto de artefactos por ejecución.
-- [x] Integrar la caché con un orquestador de experimentos y checkpoints reales de backbone/denoising.
-- [x] Añadir instrumentación de VRAM y tiempo del proceso de denoising de DenoGrad en tiempo de ejecución.
-- [x] Implementar funcionalidad de histograma global de pesos del backbone y análisis de distribución (normalidad y media cercana a 0).
-- [x] Implementar masking/pruning/2:4 para los backbones priorizados.
-- [x] Implementar métodos during-training: pruning gradual por magnitud y sparse-from-scratch con máscara fija.
-- [x] Implementar método baseline de sparsificación por magnitud (global unstructured) integrado al runner.
-- [x] Corregir 2:4 con ruta hardware-aware (detección Ampere+, elegibilidad de capas lineales y reporte de backend acelerado activo/inactivo).
-- [x] Añadir reuso de datasets denoised y benchmarks por firma experimental completa.
-- [x] Ejecutar smoke piloto tabular + temporal dense vs sparse para validación end-to-end del pipeline y artefactos.
-- [x] Ejecutar el primer piloto tabular + temporal con comparación dense vs sparse.
+Diseñar, ejecutar y documentar una campaña experimental completa para evaluar si DenoGrad se beneficia de backbones sparse obtenidos mediante un pipeline híbrido:
 
-## Tipos de sparsity
+entrenamiento con máscara -> compactación física estructural -> fine-tuning corto
 
-- Masking o pruning no estructural: se ponen ceros en pesos individuales sin cambiar la forma de las capas. Es el punto de partida más barato para comparar hipótesis.
-- Pruning estructural: se eliminan unidades completas, canales, neuronas o heads. Reduce la arquitectura efectiva y suele dar ahorro real de memoria y latencia.
-- 2:4 o semi-structured sparsity: en cada bloque de 4 pesos, 2 se ponen a cero siguiendo el patrón soportado por algunos kernels acelerados. Es la opción más interesante si el hardware y la librería la soportan.
-- Sparse-from-scratch: se entrena un modelo ya sparse desde cero o con parametrización de máscara durante todo el entrenamiento. Es una opción válida, pero no será el primer foco del estudio.
+La comparación principal debe aislar el efecto del backbone sparse sobre el proceso de denoising, manteniendo fijo el benchmark downstream. El foco del estudio no es demostrar que un predictor sparse sea mejor por sí mismo, sino medir si un backbone sparse hace más útil, eficiente y práctico a DenoGrad.
 
-## Steps
+## Hipótesis del estudio
 
-### 1. Fase 0 — Infraestructura reproducible base
+1. El uso de sparsity energy-aware con compactación física real puede mantener o mejorar la utilidad práctica de DenoGrad frente al backbone denso.
+2. Parte de esa ventaja puede venir no solo de calidad downstream, sino también de una menor huella en parámetros, tamaño del modelo y coste de inferencia o denoising.
+3. El mejor energy target y el mejor backbone pueden no ser universales; el resultado final puede requerir una recomendación por dominio o por familia de modelo.
 
-- [x] Portar o reimplementar en denograd-s las piezas experimentales que ya existen en el repo hermano: trainer, utils, evaluación de cambios, caché de noisy/denoised y patrón de configuración/orquestación.
-- [x] Hacer ejecutable el flujo real que hoy está solo esbozado en src/benchmark.py: cargar clean, inyectar ruido, benchmark noisy, entrenar backbone, ejecutar DenoGrad, benchmark sobre denoised y registrar artefactos.
-- [x] Definir un esquema único de resultados por run: dominio, dataset, seed, backbone, régimen de sparsity, ratio/patrón, hiperparámetros de DenoGrad, métricas before/after, tiempos y artefactos.
-- [x] Definir desde el inicio una política de persistencia de estados intermedios para evitar recomputación: checkpoints de modelos densos y sparse, datasets noisy y denoised, salidas intermedias de DenoGrad, resúmenes de métricas y metadatos de ejecución.
+## Alcance experimental
 
-### 2. Fase 1 — Delimitar matriz de modelos y alcance piloto
+### Dominios y datasets
 
-- Tier A del piloto: TabularDNN, FTTransformerBackbone, DLinearAdapter y MultivariateLSTM.
-- Tier B tras validación del piloto: CNN/AutoEncoder para tabular y xLSTM para series temporales.
-- Comparación primaria: sparsificar solo el backbone usado por DenoGrad y mantener fijo el benchmark downstream para no confundir calidad de denoising con calidad del predictor.
-- Comparación secundaria opcional: sparsificar también los modelos downstream una vez que la hipótesis principal esté validada.
-- Matriz recomendada por modelo:
-  - TabularDNN: masking, pruning estructural, 2:4 y sparse-from-scratch.
-  - FTTransformerBackbone: masking en Linear, pruning estructural de FFN/heads con reglas conservadoras, 2:4 en capas lineales y sparse-from-scratch solo después de estabilizar masking/estructural.
-  - DLinearAdapter: masking, estructural, 2:4 y sparse-from-scratch.
-  - MultivariateLSTM: masking y sparse-from-scratch en el piloto; pruning estructural de hidden units solo como extensión controlada.
-- Excluir del primer piloto el sparse-from-scratch y el pruning estructural de xLSTM y de modelos complejos de TimeSeriesLibrary por coste de integración y riesgo de mezclar demasiadas variables.
+- Tabular: ejecutar el estudio completo sobre todos los datasets tabulares del repositorio.
+- Series temporales: ejecutar el estudio completo sobre todos los datasets temporales del repositorio.
+- Datasets faro para screening y ablación inicial:
+  - tabular: house_prices
+  - series temporales: daily_climate
 
-### 3. Fase 2 — Capa de abstracción de sparsity
+### Familias de backbone candidatas
 
-- Introducir una interfaz común por régimen: preparar modelo denso, aplicar masking, aplicar pruning estructural, aplicar 2:4/block, entrenar sparse-from-scratch y exportar metadatos de sparsity.
-- Backend recomendado por régimen:
-  - Masking baseline: utilidades de pruning de PyTorch / torch.ao para mantener forma y facilitar ablaciones.
-  - Estructural: Torch-Pruning con example_inputs, ignored_layers y reglas específicas por familia.
-  - 2:4 / block: torchao en módulos lineales compatibles y solo cuando se pueda verificar activación de kernels sparse.
-  - Sparse-from-scratch: dejarlo como opción futura del estudio, no como prioridad inicial.
-- Añadir un barrido de sensibilidad por capa/modelo antes de lanzar experimentos grandes para identificar ratios seguros.
+- Tabular:
+  - DNN como baseline principal.
+  - FTTransformer como baseline Transformer principal.
+- Series temporales:
+  - LSTM como baseline principal.
+  - Transformer temporal con cadena de fallback explícita:
+    - iTransformer como opción preferente.
+    - PatchTST si iTransformer falla por integración, memoria, convergencia o incompatibilidad del adapter.
+    - Transformer Vanilla si iTransformer y PatchTST no son viables.
 
-#### Compatibilidad con RTX 3070 Ti
+### Qué queda fuera del alcance principal
 
-- Con dos RTX 3070 Ti sí tiene sentido probar 2:4 como línea experimental, porque la arquitectura Ampere puede servir de base para sparsidad semi-estructurada si el stack de software lo soporta.
-- Aun así, no hay que asumir speedup garantizado: la aceleración real depende de que la librería, el dtype y los kernels disponibles aprovechen el patrón 2:4.
-- En este proyecto, 2:4 se debe tratar como una hipótesis de eficiencia a validar empíricamente, no como una promesa de mejora automática.
-- Si la combinación concreta de GPU, PyTorch y torchao no activa kernels sparse, el experimento sigue siendo útil como comparación de calidad y memoria, aunque no como prueba de speedup de hardware.
-- Implementación actual: el método 2:4 del proyecto aplica primero la máscara 2:4 y después intenta conversión a representación semi-estructurada acelerable en módulos `Linear` elegibles, registrando en artefactos qué módulos quedaron realmente acelerados.
-- Requisitos prácticos para activar aceleración 2:4: GPU Ampere+, CUDA activa, capas lineales con `in_features` múltiplo de 4 y dtype compatible (`fp16` o `bf16`) en la ruta de ejecución relevante.
+- La sensibilidad al ruido no forma parte de esta campaña principal, porque ya está estudiada en el artículo base de DenoGrad, arXiv:2511.10161.
+- Los hitos históricos de planes anteriores no se reutilizan como criterio de avance.
+- Sparse-from-scratch, xLSTM y variantes complejas de TimeSeriesLibrary quedan fuera de la primera oleada salvo necesidad justificada posterior.
 
-### 4. Fase 3 — Protocolo experimental y reglas de justicia
+## Configuración operativa de referencia
 
-- Para cada dataset/modelo/régimen/seed:
-  - partir del mismo dataset clean y de la misma realización de ruido;
-  - entrenar baseline denso sobre noisy;
-  - entrenar o derivar la versión sparse con mismo optimizador, epochs, patience y seed;
-  - ejecutar DenoGrad por separado con backbone denso y sparse usando exactamente los mismos hiperparámetros;
-  - medir la huella del backbone antes y después de sparsification, tanto en memoria teórica de parámetros como en VRAM ocupada durante carga e inferencia cuando haya CUDA;
-  - medir como métrica temporal prioritaria el tiempo del proceso de denoising de DenoGrad con backbone denso y sparse, bajo el mismo batch size y el mismo protocolo de calentamiento y repetición;
-  - reconstruir train/val/test de forma consistente para noisy y denoised;
-  - ejecutar el mismo benchmark downstream sobre ambas condiciones.
-- Reutilizar artefactos persistidos siempre que la firma experimental coincida exactamente: dataset, split, seed, ruido, backbone, régimen sparse, ratio, hiperparámetros de DenoGrad y versión del código.
-- Comparar tres niveles:
-  - denso vs sparse sin denoising;
-  - mejora por DenoGrad con backbone denso vs mejora por DenoGrad con backbone sparse;
-  - mejora o paridad por unidad de sparsity, latencia, VRAM y parámetros.
-- Usar 2 seeds en el piloto y reservar 3-5 seeds para la expansión completa.
+### DenoGrad
 
-### 4.1 Política de caché y artefactos reutilizables
+- eta = 0.01 como valor por defecto.
+- tau = 0.1 como valor por defecto.
+- max_iters en el rango 100-200 con early stopping por umbral.
+- Comparaciones dense vs sparse siempre con exactamente los mismos hiperparámetros de DenoGrad.
 
-- Persistir checkpoints de entrenamiento para:
-  - backbone denso pre-DenoGrad;
-  - backbone sparse post-pruning o sparse-from-scratch;
-  - modelos reentrenados o fine-tuned tras sparsification cuando aplique.
-- Persistir datasets y tensores intermedios para:
-  - dataset clean de referencia usado en cada run;
-  - dataset noisy generado con su seed;
-  - dataset denoised con backbone denso;
-  - dataset denoised con backbone sparse;
-  - alineaciones o reconstrucciones temporales necesarias para series temporales.
-- Persistir resultados y metadatos para:
-  - métricas before/after por fase;
-  - tiempos por etapa;
-  - VRAM, memoria de parámetros, tamaño de checkpoint y densidad efectiva;
-  - hashes o firmas de configuración para invalidar caché cuando cambie algo relevante.
-- Separar artefactos por nivel para no contaminar comparaciones:
-  - cache de datos;
-  - cache de modelos;
-  - cache de benchmarking;
-  - cache de métricas y figuras.
-- Guardar un manifiesto por run con rutas a todos los artefactos producidos para poder reanudar experimentos parciales y reconstruir tablas sin reejecutar todo.
-- Permitir reanudación por etapa:
-  - si existe checkpoint del backbone, saltar reentrenamiento;
-  - si existe salida denoised válida, saltar DenoGrad;
-  - si existe benchmark downstream con la misma firma, saltar reevaluación;
-  - si existen métricas agregadas y artefactos base, regenerar solo tablas o figuras si hace falta.
-- Añadir reglas de invalidación conservadoras: cualquier cambio en arquitectura, sparsity pattern, ratio, seed, split, hiperparámetros de DenoGrad o versión de preprocesado invalida el artefacto dependiente.
+### Entrenamiento del backbone
 
-### 5. Fase 4 — Paquete de métricas para responder la hipótesis
+- 100 épocas como configuración estándar.
+- Early stopping con patience = 15.
+- Misma seed, mismo split y mismo protocolo de entrenamiento al comparar dense vs sparse.
 
-- Métricas de calidad de denoising usando la referencia clean previa a la inyección sintética de ruido:
-  - SWD(clean, noisy) y SWD(clean, denoised), junto con reducción relativa;
-  - correlación de Pearson por variable entre clean-vs-noisy y clean-vs-denoised;
-  - preservación de estructura de correlación: distancia entre matrices de correlación de clean, noisy y denoised;
-  - para series temporales, perfiles de autocorrelación por variable hasta un lag K comparando clean, noisy y denoised;
-  - opcionalmente MAE/MSE entre clean y denoised para sanity check.
-- Métricas downstream:
-  - MSE, RMSE y MAE por modelo;
-  - mejora relativa sobre noisy baseline por cada modelo downstream;
-  - score agregado por dataset contando wins/ties/losses o media normalizada.
-- Métricas de eficiencia:
-  - tiempo de entrenamiento, tiempo de denoising, tiempo de benchmark y latencia de inferencia del backbone cuando sea útil como diagnóstico secundario;
-  - tiempo del proceso de denoising de DenoGrad antes y después de sparsification, reportado como media, desviación y speedup relativo;
-  - tamaño del backbone en memoria: número de parámetros, número de parámetros no nulos, densidad efectiva, tamaño estimado en memoria de pesos y checkpoints;
-  - VRAM del backbone antes y después de sparsification: memoria reservada, memoria asignada y pico de memoria durante inferencia o denoising cuando se ejecute en CUDA;
-  - MACs/FLOPs estimados;
-  - cuando proceda, speedup sparse real frente al denso.
-- Métricas de distribución de pesos del backbone (nuevo bloque para justificar sparsity):
-  - histograma global de pesos del modelo completo (concatenando todos los parámetros entrenables) para denso y sparse;
-  - media, desviación estándar, asimetría y curtosis de la distribución de pesos;
-  - contraste de normalidad (por ejemplo, Shapiro-Wilk en submuestra o alternativa robusta para tamaños grandes) y error frente a una Normal ajustada;
-  - proporción de pesos en bandas alrededor de 0 (por ejemplo |w| < epsilon) para estimar masa cercana a cero;
-  - comparación before/after sparsification para verificar si la hipótesis de distribución aproximadamente normal centrada en 0 respalda un pruning por magnitud.
-- Métrica de interacción que responde la pregunta principal:
-  - DenoGrad Benefit = error benchmark noisy - error benchmark denoised.
-  - Sparse Synergy = Benefit con backbone sparse - Benefit con backbone denso.
-- Criterio de éxito práctico adicional:
-  - si DenoGrad-sparse no mejora de forma clara las métricas downstream pero las mantiene aproximadamente al mismo nivel que DenoGrad-denso, el resultado sigue siendo positivo si se obtiene una reducción sustancial de VRAM, tamaño de backbone y/o tiempo del proceso de denoising.
+### Pipeline sparse canónico
 
-### 6. Fase 5 — Visualizaciones y reporting
+- Método during-training: sparse_on_training.
+- Umbral por capa: threshold_l = k * sigma_l.
+- k = 0.1 como configuración inicial de referencia.
+- layer_priority_strength = 1.0 para hacer la poda más agresiva en capas finales que en capas iniciales.
+- Compactación post-training: structured_compact con selección energy-aware.
+- Fine-tuning corto sobre modelo compactado:
+  - 10-15 épocas.
+  - patience corta.
+  - nuevo optimizador con LR reducido, recomendado lr / 10 respecto al entrenamiento principal.
+  - sin modificar trainer.py; la orquestación debe hacerse desde experiment_runner.
 
-- Gráficas de dataset:
-  - overlays clean/noisy/denoised en series temporales;
-  - comparaciones marginales o scatter en tabular;
-  - heatmaps de correlación y heatmaps de diferencias;
-  - barras de mejora en SWD/correlación.
-- Gráficas de modelo:
-  - histogramas de pesos del backbone completo (denso vs sparse), con curva de densidad y superposición de Normal ajustada;
-  - QQ-plot de pesos para evaluar visualmente la hipótesis de normalidad;
-  - curvas sparsity vs mejora downstream;
-  - sparsity vs latencia/params/MACs/VRAM;
-  - before/after de VRAM y tamaño del backbone para denso vs sparse;
-  - before/after del tiempo del proceso de denoising de DenoGrad para denso vs sparse;
-  - deltas de beneficio de DenoGrad entre denso y sparse por familia.
-- Tablas del estudio:
-  - resumen por dataset/modelo/régimen;
-  - leaderboard del piloto en Sparse Synergy;
-  - tabla de ablación de ratios y seeds.
-- Tablas operativas adicionales:
-  - inventario de artefactos reutilizados vs recomputados;
-  - ahorro acumulado de tiempo gracias a caché, checkpoints y reutilización de datasets denoised.
+### Restricciones de implementación heredadas y vigentes
 
-### 7. Fase 6 — Plan de ejecución del piloto
+- El fine-tuning debe reutilizar Trainer con un nuevo optimizador y el modelo ya podado como punto de partida.
+- Deben guardarse artefactos intermedios por fase: modelo masked, modelo compactado y modelo finetuned.
+- La compactación debe ser física y confirmar reducción real de parámetros, no solo aparición de ceros en pesos.
+- El benchmark downstream debe permanecer fijo en la comparación principal.
 
-- Datasets recomendados del piloto:
-  - tabular: house_prices y parkinsons;
-  - series temporales: daily_climate y microsoft_stock.
-- Matriz recomendada del piloto:
-  - TabularDNN en ambos datasets tabulares;
-  - FTTransformerBackbone en ambos datasets tabulares cuando TabularDNN esté estabilizado;
-  - DLinearAdapter y MultivariateLSTM en ambos datasets temporales.
-- Regímenes mínimos del piloto:
-  - masking por magnitud;
-  - pruning estructural;
-  - 2:4 acelerable si el hardware lo soporta;
-  - sparse-from-scratch solo como fase posterior, no en la primera iteración.
-- Ratios recomendados del piloto:
-  - dos niveles para masking/estructural;
-  - patrón fijo 2:4;
-  - una densidad objetivo para sparse-from-scratch equivalente al nivel medio.
-- Criterio de paso a expansión:
-  - al menos un régimen sparse debe superar al baseline denso en Sparse Synergy tanto en un modelo tabular como en uno temporal, o bien mantener un rendimiento downstream aproximadamente equivalente con mejoras materiales de VRAM, tamaño del backbone o tiempo del proceso de denoising de DenoGrad, sin regresiones severas de estabilidad.
+## Métricas obligatorias
 
-### 8. Fase 7 — Expansión tras piloto
+### Calidad de denoising
 
-- Añadir CNN/AutoEncoder y opcionalmente xLSTM.
-- Escalar a todos los datasets y más seeds.
-- Introducir predictors downstream sparse como eje factorial separado si la hipótesis principal ya está respaldada.
-- Añadir análisis estadístico y tablas finales orientadas a paper.
+- SWD.
+- Correlación de Pearson.
+- Si la implementación lo permite, preservación de estructura de correlación y análisis cualitativo cuando haya desacople entre benchmark y métricas de denoising.
 
-## Relevant files
+### Calidad downstream
 
-- /home/jjavier98/denograd-s/README.md — objetivo del repo: usar modelos sparse como backbones de DenoGrad.
-- /home/jjavier98/denograd-s/src/benchmark.py — esqueleto actual del benchmark tabular/TS, punto central de reutilización.
-- /home/jjavier98/denograd-s/src/models/__init__.py — factoría de modelos y wrapper, mejor punto para introducir construcción sparsity-aware.
-- /home/jjavier98/denograd-s/src/models/dnn.py — primer candidato para cubrir los cuatro regímenes.
-- /home/jjavier98/denograd-s/src/models/ft_transformer.py — candidato Transformer tabular; requiere reglas específicas para pruning de capas lineales/heads.
-- /home/jjavier98/denograd-s/src/models/dlinear_adapter.py — objetivo TS lineal, ideal para estructural y 2:4.
-- /home/jjavier98/denograd-s/src/models/lstm.py — baseline recurrente; conviene mantener el piloto conservador.
-- /home/jjavier98/denograd-s/src/test.py — útil solo para smoke tests, no como orquestador principal.
-- /home/jjavier98/denograd-s/data/tabular — datasets tabulares del piloto.
-- /home/jjavier98/denograd-s/data/time_series — datasets TS del piloto.
+- Benchmark improvement respecto al baseline noisy.
+- MSE, RMSE y MAE cuando estén disponibles.
+- Wins, ties y losses frente a dense por dataset.
 
-## Verification
+### Eficiencia
 
-1. Smoke test end-to-end en un dataset tabular y uno temporal pequeños: benchmark noisy, entrenamiento backbone, DenoGrad, benchmark denoised, export de métricas y generación de una figura.
-2. Validar automáticamente invariantes de justicia experimental: mismos índices de split, misma seed de ruido, mismos hiperparámetros de DenoGrad y mismo benchmark downstream entre comparaciones dense/sparse.
-3. Para cada backend de sparsity, ejecutar checks de forma e inferencia antes de lanzar entrenamientos completos y verificar que el output conserva la misma semántica que el baseline denso.
-4. Registrar por separado fallos por régimen: graph inválido en pruning estructural, kernel sparse no disponible, divergencia en sparse-from-scratch y OOM/timeouts en benchmarks.
-5. Exigir que cada run del piloto produzca bundle completo de artefactos: snapshot de config, JSON/CSV de métricas, tiempos, gráficas, resumen de sparsity y métricas de memoria del backbone y VRAM.
-6. Validar que las métricas de memoria y VRAM se capturan con el mismo protocolo en denso y sparse, incluyendo reset de picos de CUDA y mismo tamaño de lote.
-7. Antes de escalar a todos los datasets, reproducir el comportamiento de dense vs sparse en una segunda seed y comprobar que la ordenación noisy/denoised sigue siendo coherente.
-8. Verificar que la reutilización de caché no mezcla artefactos incompatibles, comprobando la firma experimental completa antes de reusar checkpoints, datasets denoised o resultados downstream.
-9. Verificar que cada run guarde artefactos de distribución de pesos del backbone: histograma (figura), estadísticos descriptivos y resultado del test de normalidad para denso y sparse.
+- Número total de parámetros.
+- Parámetros no nulos y densidad efectiva cuando aplique.
+- Tamaño del modelo en bytes y en formato humano (KB, MB, GB).
+- Tiempo de inferencia.
+- Tiempo total del proceso de denoising.
+- VRAM: allocated, reserved, pico y allocated neta.
+- Speedup o slowdown relativo frente a dense cuando esté justificado.
 
-## Decisions
+### Métricas estructurales y de trazabilidad
 
-- La prueba principal es si un backbone sparse hace más útil a DenoGrad, no si un predictor sparse post-denoising es mejor por sí mismo.
-- La recomendación técnica es combinar varias librerías: PyTorch/torch.ao para masks y sparse-from-scratch básicos, Torch-Pruning para pruning estructural y torchao solo cuando haya soporte real para 2:4/block.
-- El piloto cubre los cuatro regímenes, pero no todos los modelos con la misma profundidad. LSTM entra de forma conservadora y xLSTM queda fuera hasta estabilizar la infraestructura.
-- El orden de ataque del estudio es masking primero, pruning estructural después y 2:4 en paralelo como hipótesis de aceleración; sparse-from-scratch queda reservado para una segunda ola.
-- Las métricas de calidad deben usar como referencia el dataset clean previo al ruido sintético siempre que esté disponible; comparar noisy contra denoised sin clean es insuficiente para medir denoising.
-- El benchmark downstream debe mantenerse fijo en el estudio principal para evitar confundir mejor denoising con mejor compresión del predictor.
-- La evaluación de éxito no depende solo de mejorar el benchmark downstream: una paridad razonable con reducciones claras de VRAM, tamaño del backbone o tiempo del proceso de denoising de DenoGrad también cuenta como resultado valioso.
-- La métrica temporal principal del estudio es el tiempo total del proceso de denoising de DenoGrad; cualquier otra latencia se considera secundaria salvo que ayude a diagnosticar el comportamiento del backbone sparse.
-- El sistema debe guardar y reutilizar todos los estados intermedios relevantes siempre que sea seguro hacerlo, porque reducir recomputación es parte del valor práctico del pipeline y además mejora la trazabilidad de métricas.
+- Número de unidades retenidas o podadas tras compactación.
+- param_reduction_ratio real.
+- Registro de artefactos por fase y manifiesto por run.
 
-## Further considerations
+## Visualizaciones obligatorias
 
-1. Si no hay soporte de kernels 2:4 en la GPU disponible, mantener 2:4 como régimen de precisión/estructura en el piloto y posponer cualquier claim de speedup real.
-2. Si el pruning estructural en LSTM resulta frágil, rebajarlo a masking + sparse-from-scratch en el piloto y dejar el pruning recurrente estructural para la expansión.
-3. Si el beneficio depende mucho del nivel de ruido, introducir un barrido corto de sensibilidad al ruido antes de escalar a todos los datasets.
+- Curvas de ablación energy target vs benchmark improvement.
+- Curvas energy target vs SWD.
+- Curvas energy target vs correlación.
+- Barras dense vs sparse por dataset para benchmark, SWD, correlación, parámetros, MB y tiempo de inferencia.
+- Scatter o burbujas tipo Pareto para calidad vs coste.
+- Heatmaps dataset x backbone x energy target.
+- Gráficas cualitativas clean/noisy/denoised para casos representativos.
+- La figura dense_vs_sparse principal debe separar memoria y tiempo, o usar doble eje y de forma clara.
+- allocated_net_bytes no debe aparecer en la figura principal; si hace falta, debe quedar en tablas o anexos.
+
+## Organización de resultados
+
+La campaña debe dejar una estructura clara y navegable:
+
+- resultados raw por run,
+- agregados del estudio,
+- tablas finales,
+- figuras finales,
+- reportes narrativos,
+- manifiesto maestro del estudio.
+
+Debe mantenerse un índice maestro con enlaces a:
+
+- seed,
+- config,
+- resumen agregado,
+- figuras derivadas,
+- rutas de artefactos por fase.
+
+## Fases del plan
+
+### Fase 0 — Consolidación de infraestructura
+
+- Formalizar el manifiesto maestro del estudio.
+- Normalizar el contrato de resultados por run.
+- Asegurar agregación multi-run desde el índice global existente.
+- Garantizar persistencia y reutilización segura de checkpoints, datasets noisy y datasets denoised.
+
+### Fase 1 — Integración de backbones Transformer
+
+- Verificar FTTransformer en tabular con paso completo dense y sparse.
+- Integrar Transformer temporal con fallback ordenado:
+  - iTransformer,
+  - PatchTST,
+  - Transformer Vanilla.
+- Registrar siempre el motivo técnico del fallback si ocurre.
+
+### Fase 2 — Screening de backbones en datasets faro
+
+- Tabular en house_prices: DNN vs FTTransformer.
+- Temporal en daily_climate: LSTM vs Transformer temporal adoptado.
+- Ejecutar dense y sparse con energy target inicial = 0.95.
+- Ejecutar 3 seeds por dataset.
+- Selección con este orden:
+  1. benchmark improvement,
+  2. SWD y correlación,
+  3. eficiencia en parámetros, MB e inferencia.
+
+### Fase 3 — Ablación de energy targets
+
+- Ejecutar ablación en house_prices y daily_climate.
+- Targets obligatorios:
+  - 0.80,
+  - 0.85,
+  - 0.90,
+  - 0.95.
+- Ejecutar 3 seeds por combinación.
+- Registrar dense vs sparse y todos los deltas asociados.
+- Generar frentes de Pareto calidad-eficiencia.
+
+### Fase 4 — Selección de configuración ganadora
+
+- Elegir ganador tabular y ganador temporal.
+- Si el mejor backbone o energy target diverge por familia, conservar también una recomendación por familia.
+- No forzar una regla universal si los resultados no la sostienen.
+
+### Fase 5 — Campaña completa sobre todos los datasets
+
+- Ejecutar la mejor configuración tabular en todos los datasets tabulares.
+- Ejecutar la mejor configuración temporal en todos los datasets temporales.
+- Ejecutar 3 seeds por dataset.
+- Permitir fallback explícito a un backbone estable cuando haya fallo real de memoria, convergencia o compatibilidad.
+
+### Fase 6 — Tablas comparativas finales
+
+- Tablas dense vs sparse por dataset y dominio.
+- Tabla de wins/ties/losses.
+- Tabla de selección de backbone.
+- Tabla de recomendaciones finales:
+  - recomendación global,
+  - recomendación por dominio,
+  - recomendación por familia si difiere.
+
+### Fase 7 — Gráficas y narrativa visual
+
+- Curvas, heatmaps, scatter de Pareto y paneles cualitativos.
+- Figura ejecutiva final de calidad vs coste computacional.
+- Presentación explícita de los casos donde Transformer mejora calidad pero no compensa coste, si ocurre.
+
+### Fase 8 — Cierre, trazabilidad y publicación interna
+
+- Reporte ejecutivo.
+- Reporte técnico.
+- Snapshot de configuración ganadora por dominio.
+- Snapshot de mejor configuración por familia si difiere.
+- Snapshot del grid completo de ablación.
+
+### Fase 9 — Extensiones recomendadas no bloqueantes
+
+- Robustez estadística: mediana, ranking promedio y pruebas sencillas de significancia o bootstrap cuando compense.
+- Impacto de despliegue: análisis de memoria, tamaño y tiempo de inferencia como proxy de viabilidad real.
+- Análisis de fallos: documentar datasets o backbones donde sparse empeora de forma clara.
+- Contexto bibliográfico: citar explícitamente que la sensibilidad al ruido ya está cubierta en el paper base de DenoGrad.
+
+## Verificación mínima antes de escalar
+
+1. Smoke test dense y sparse en house_prices con DNN y FTTransformer.
+2. Smoke test dense y sparse en daily_climate con LSTM y el Transformer temporal finalmente adoptado.
+3. Confirmación de que cada run exporta el bundle mínimo de métricas y artefactos.
+4. Verificación de igualdad de split, seed de ruido, benchmark downstream y criterio de parada entre dense y sparse.
+5. Revisión de frentes de Pareto antes de elegir configuración ganadora.
+6. Revisión cualitativa explícita cuando benchmark improvement y SWD o correlación diverjan.
+
+## Decisiones vigentes
+
+- Archivo canónico del plan: este documento.
+- Pipeline sparse principal: sparse_on_training + structured_compact + fine-tuning corto.
+- Configuración base during-training: k = 0.1 y layer_priority_strength = 1.0.
+- Configuración estadística de campaña: 3 seeds por dataset y agregación por media con dispersión.
+- Fallback temporal oficial: iTransformer -> PatchTST -> Transformer Vanilla.
+- El estudio no repite sensibilidad al ruido; se cita el artículo base de DenoGrad para ese punto.
+- Las afirmaciones de speedup real solo se hacen si benchmark_inference las respalda de forma consistente.
+
+## Archivos relevantes
+
+- src/libs/experiment_runner.py
+- src/libs/sparsity.py
+- src/libs/trainer.py
+- src/libs/benchmark.py
+- src/libs/evaluation.py
+- src/libs/profiling.py
+- src/models/__init__.py
+- src/models/ft_transformer.py
+- src/models/lstm.py
+- src/models/TimeSeriesLibrary/models/iTransformer.py
+- src/models/TimeSeriesLibrary/models/PatchTST.py
+- src/models/TimeSeriesLibrary/models/Transformer.py
+- out/meta/indexes/runs.jsonl
+- out/meta/summaries

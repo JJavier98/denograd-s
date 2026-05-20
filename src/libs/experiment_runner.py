@@ -1,6 +1,8 @@
 """End-to-end experiment runners with caching, checkpoints and denoising profiling."""
 
 import copy
+import datetime
+import json
 import re
 import time
 from pathlib import Path
@@ -10,25 +12,25 @@ import torch
 import torch.nn as nn
 from sklearn.preprocessing import StandardScaler
 
-from src.benchmark import run_regression_benchmark, run_ts_benchmark
-from src.cache import ExperimentCache, make_experiment_signature
-from src.dataset import (
+from src.libs.benchmark import run_regression_benchmark, run_ts_benchmark
+from src.libs.cache import ExperimentCache, make_experiment_signature
+from src.libs.dataset import (
     add_gaussian_noise,
     fix_noise_seed,
     get_dataloaders,
     get_ts_dataloaders,
     load_data,
 )
-from src.evaluation import evaluate_changes
+from src.libs.evaluation import evaluate_changes
 from src.models import get_model
-from src.profiling import model_size_bytes, reset_cuda_peak_memory, snapshot_cuda_memory
-from src.sparsity import (
+from src.libs.profiling import model_size_bytes, reset_cuda_peak_memory, snapshot_cuda_memory
+from src.libs.sparsity import (
     apply_post_training_sparsification,
     build_training_sparsity_controller,
     summarize_sparsity,
 )
-from src.trainer import Trainer
-from src.weight_analysis import analyze_model_weights, save_weight_histogram_plot
+from src.libs.trainer import Trainer
+from src.libs.weight_analysis import analyze_model_weights, save_weight_histogram_plot
 
 try:
     from denograd import DenoGrad
@@ -95,26 +97,92 @@ def _sparsity_label(sparsity_cfg):
     if not cfg.get("enabled", False):
         return "dense"
     method = _slugify(cfg.get("method", "unknown"))
-    ratio = str(cfg.get("ratio", "na")).replace(".", "p")
-    return f"{method}_{ratio}"
+    if "ratio" in cfg:
+        value = f"r{str(cfg.get('ratio', 'na')).replace('.', 'p')}"
+    elif "variance_pct" in cfg:
+        value = f"vp{str(cfg.get('variance_pct', 'na')).replace('.', 'p')}"
+    else:
+        value = "na"
+    return f"{method}_{value}"
+
+
+def _ensure_output_schema(root: Path) -> None:
+    """Create and maintain the canonical output schema anchors."""
+    canonical_dirs = [
+        root / "tabular",
+        root / "time_series",
+        root / "meta" / "indexes",
+        root / "meta" / "summaries",
+        root / "meta" / "migrations",
+        root / "meta" / "legacy",
+        root / "archive",
+    ]
+    for directory in canonical_dirs:
+        directory.mkdir(parents=True, exist_ok=True)
+
+    schema_file = root / "SCHEMA_VERSION"
+    schema_file.write_text("2\n", encoding="utf-8")
+
+
+def _append_run_index(artifact_cache: ExperimentCache, config: dict, domain: str) -> None:
+    """Append one line to the global run index for fast traceability."""
+    root = Path(config.get("artifacts_dir", "out"))
+    _ensure_output_schema(root)
+
+    record = {
+        "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+        "domain": domain,
+        "dataset": _dataset_label(_as_dict(config.get("dataset", {}))),
+        "model": _slugify(_as_dict(config.get("model", {})).get("name", "model")),
+        "sparse": _sparsity_label(_as_dict(config.get("sparsity", {}))),
+        "seed": config.get("seed", 42),
+        "version": config.get("version", "v1"),
+        "signature": artifact_cache.signature,
+        "run_root": str(artifact_cache.root),
+        "manifest": str(artifact_cache.json_path("manifest", kind="logs")),
+        "summary_tabular": str(artifact_cache.json_path("summary_tabular", kind="metrics")),
+        "summary_ts": str(artifact_cache.json_path("summary_ts", kind="metrics")),
+    }
+
+    index_path = root / "meta" / "indexes" / "runs.jsonl"
+    with index_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=True) + "\n")
 
 
 def _build_artifacts_base_dir(config, domain):
-    """Compose human-readable base path under artifacts root before signature folder."""
+    """Compose human-readable base path under artifacts root before signature folder.
+
+    Layout::
+
+        out/
+            {domain}/              # tabular | time_series
+                {dataset}/         # house_prices_kc_house_data | daily_climate_...
+                    {sparse_type}/ # dense | structured_compact_0p3 | ...
+                        {backbone}/# dnn | lstm | dlinear | ...
+                            {params}/ # seed42__ep100__iter150__vreal_v2__20260518_151000
+    """
     root = Path(config.get("artifacts_dir", "out"))
+    _ensure_output_schema(root)
     dataset_cfg = _as_dict(config.get("dataset", {}))
     model_cfg = _as_dict(config.get("model", {}))
     sparsity_cfg = _as_dict(config.get("sparsity", {}))
+    denograd_cfg = _as_dict(config.get("denograd", {}))
 
     domain_dir = "time_series" if domain == "time_series" else "tabular"
     dataset = _dataset_label(dataset_cfg)
     model = _slugify(model_cfg.get("name", "model"))
     sparse = _sparsity_label(sparsity_cfg)
     seed = config.get("seed", 42)
+    epochs = model_cfg.get("max_epochs", "na")
+    denograd_iters = denograd_cfg.get("max_iters", "na")
     version = _slugify(config.get("version", "v1"))
+    launched_at = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    run_label = f"{dataset}__{model}__{sparse}__seed{seed}__{version}"
-    return root / domain_dir / run_label
+    run_label = (
+        f"seed{seed}__ep{epochs}__iter{denograd_iters}"
+        f"__v{version}__{launched_at}"
+    )
+    return root / domain_dir / dataset / sparse / model / run_label
 
 
 def _store_run_context(artifact_cache, payload, config):
@@ -218,16 +286,39 @@ def _load_or_prepare_ts_data(config, artifact_cache):
 
 def _measure_denoising_call(callable_transform, device):
     """Measure denoising runtime and CUDA memory around a transform callable."""
+    before = None
     if device.type == "cuda" and torch.cuda.is_available():
         reset_cuda_peak_memory(device)
         torch.cuda.synchronize(device)
+        before = snapshot_cuda_memory(device)
+
     start = time.perf_counter()
     output = callable_transform()
     if device.type == "cuda" and torch.cuda.is_available():
         torch.cuda.synchronize(device)
     elapsed = time.perf_counter() - start
-    memory = snapshot_cuda_memory(device)
-    return output, elapsed, None if memory is None else memory.__dict__
+
+    after = snapshot_cuda_memory(device)
+    if after is None:
+        return output, elapsed, None
+
+    payload = dict(after.__dict__)
+    if before is not None:
+        payload["allocated_before_bytes"] = before.allocated_bytes
+        payload["reserved_before_bytes"] = before.reserved_bytes
+        payload["allocated_after_bytes"] = after.allocated_bytes
+        payload["reserved_after_bytes"] = after.reserved_bytes
+        payload["allocated_net_bytes"] = after.allocated_bytes - before.allocated_bytes
+        payload["reserved_net_bytes"] = after.reserved_bytes - before.reserved_bytes
+    else:
+        payload["allocated_before_bytes"] = None
+        payload["reserved_before_bytes"] = None
+        payload["allocated_after_bytes"] = after.allocated_bytes
+        payload["reserved_after_bytes"] = after.reserved_bytes
+        payload["allocated_net_bytes"] = None
+        payload["reserved_net_bytes"] = None
+
+    return output, elapsed, payload
 
 
 def _analyze_and_store_weights(model, artifact_cache, tag, weight_cfg):
@@ -258,6 +349,176 @@ def _analyze_and_store_weights(model, artifact_cache, tag, weight_cfg):
     return analysis, fig_info
 
 
+def _human_bytes(num_bytes):
+    """Format byte values as human-readable strings (KB/MB/GB)."""
+    if num_bytes is None:
+        return "n/a"
+    value = float(num_bytes)
+    units = ["B", "KB", "MB", "GB", "TB"]
+    idx = 0
+    while abs(value) >= 1024.0 and idx < len(units) - 1:
+        value /= 1024.0
+        idx += 1
+    return f"{value:.2f} {units[idx]}"
+
+
+def _safe_pct_change(before, after):
+    """Compute percentage change with safe handling for zeros and nulls."""
+    if before is None or after is None:
+        return None
+    if before == 0:
+        return None
+    return ((after - before) / before) * 100.0
+
+
+def _build_dense_sparse_comparison(dense_profile, sparse_profile):
+    """Build machine and human-readable dense vs sparse comparison payload."""
+    dense_stats = (dense_profile or {}).get("backbone_stats", {})
+    sparse_stats = (sparse_profile or {}).get("backbone_stats", {})
+    dense_vram = (dense_profile or {}).get("denoising_vram", {})
+    sparse_vram = (sparse_profile or {}).get("denoising_vram", {})
+
+    dense_param_bytes = dense_stats.get("param_bytes")
+    sparse_param_bytes = sparse_stats.get("param_bytes")
+    dense_params = dense_stats.get("total_params")
+    sparse_params = sparse_stats.get("total_params")
+    dense_seconds = (dense_profile or {}).get("denoising_seconds")
+    sparse_seconds = (sparse_profile or {}).get("denoising_seconds")
+    dense_alloc_net = dense_vram.get("allocated_net_bytes")
+    sparse_alloc_net = sparse_vram.get("allocated_net_bytes")
+
+    comparison = {
+        "machine": {
+            "param_bytes": {
+                "dense": dense_param_bytes,
+                "sparse": sparse_param_bytes,
+                "delta": None if dense_param_bytes is None or sparse_param_bytes is None else sparse_param_bytes - dense_param_bytes,
+                "delta_pct": _safe_pct_change(dense_param_bytes, sparse_param_bytes),
+            },
+            "total_params": {
+                "dense": dense_params,
+                "sparse": sparse_params,
+                "delta": None if dense_params is None or sparse_params is None else sparse_params - dense_params,
+                "delta_pct": _safe_pct_change(dense_params, sparse_params),
+            },
+            "denoising_seconds": {
+                "dense": dense_seconds,
+                "sparse": sparse_seconds,
+                "delta": None if dense_seconds is None or sparse_seconds is None else sparse_seconds - dense_seconds,
+                "delta_pct": _safe_pct_change(dense_seconds, sparse_seconds),
+                "speedup_x": None if dense_seconds is None or sparse_seconds in (None, 0) else dense_seconds / sparse_seconds,
+            },
+            "allocated_net_bytes": {
+                "dense": dense_alloc_net,
+                "sparse": sparse_alloc_net,
+                "delta": None if dense_alloc_net is None or sparse_alloc_net is None else sparse_alloc_net - dense_alloc_net,
+                "delta_pct": _safe_pct_change(dense_alloc_net, sparse_alloc_net),
+            },
+        },
+        "human": {
+            "param_bytes": {
+                "dense": _human_bytes(dense_param_bytes),
+                "sparse": _human_bytes(sparse_param_bytes),
+                "delta": _human_bytes(None if dense_param_bytes is None or sparse_param_bytes is None else sparse_param_bytes - dense_param_bytes),
+            },
+            "allocated_net_bytes": {
+                "dense": _human_bytes(dense_alloc_net),
+                "sparse": _human_bytes(sparse_alloc_net),
+                "delta": _human_bytes(None if dense_alloc_net is None or sparse_alloc_net is None else sparse_alloc_net - dense_alloc_net),
+            },
+        },
+    }
+    return comparison
+
+
+def _comparison_table_markdown(comparison):
+    """Build a compact markdown table from dense/sparse comparison metrics."""
+    machine = comparison.get("machine", {})
+    rows = [
+        ("param_bytes", machine.get("param_bytes", {})),
+        ("total_params", machine.get("total_params", {})),
+        ("denoising_seconds", machine.get("denoising_seconds", {})),
+        ("allocated_net_bytes", machine.get("allocated_net_bytes", {})),
+    ]
+    lines = [
+        "| metric | dense | sparse | delta | delta_pct |",
+        "|---|---:|---:|---:|---:|",
+    ]
+    for name, payload in rows:
+        dense = payload.get("dense")
+        sparse = payload.get("sparse")
+        delta = payload.get("delta")
+        delta_pct = payload.get("delta_pct")
+        dense_s = f"{dense:.6g}" if isinstance(dense, (int, float)) else "n/a"
+        sparse_s = f"{sparse:.6g}" if isinstance(sparse, (int, float)) else "n/a"
+        delta_s = f"{delta:.6g}" if isinstance(delta, (int, float)) else "n/a"
+        delta_pct_s = f"{delta_pct:.4f}%" if isinstance(delta_pct, (int, float)) else "n/a"
+        lines.append(f"| {name} | {dense_s} | {sparse_s} | {delta_s} | {delta_pct_s} |")
+    return "\n".join(lines)
+
+
+def _save_dense_sparse_plot(comparison, output_path):
+    """Save dense vs sparse plots with separate scales for bytes and time."""
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return {"saved": False, "reason": "matplotlib_not_available", "path": str(output_path)}
+
+    machine = comparison.get("machine", {})
+    param_payload = machine.get("param_bytes", {})
+    time_payload = machine.get("denoising_seconds", {})
+    dense_param = param_payload.get("dense")
+    sparse_param = param_payload.get("sparse")
+    dense_time = time_payload.get("dense")
+    sparse_time = time_payload.get("sparse")
+
+    if not all(isinstance(v, (int, float)) for v in [dense_param, sparse_param, dense_time, sparse_time]):
+        return {"saved": False, "reason": "missing_param_or_time_metrics", "path": str(output_path)}
+
+    unit = "B"
+    scale = 1.0
+    max_param = max(abs(float(dense_param)), abs(float(sparse_param)))
+    if max_param >= 1024 ** 3:
+        unit, scale = "GB", float(1024 ** 3)
+    elif max_param >= 1024 ** 2:
+        unit, scale = "MB", float(1024 ** 2)
+    elif max_param >= 1024:
+        unit, scale = "KB", 1024.0
+
+    dense_param_scaled = float(dense_param) / scale
+    sparse_param_scaled = float(sparse_param) / scale
+
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.6))
+    axes[0].bar(["dense", "sparse"], [dense_param_scaled, sparse_param_scaled], color=["#4C72B0", "#55A868"])
+    axes[0].set_title("Backbone Size")
+    axes[0].set_ylabel(f"param_bytes ({unit})")
+    axes[0].grid(axis="y", alpha=0.2)
+
+    axes[1].bar(["dense", "sparse"], [float(dense_time), float(sparse_time)], color=["#4C72B0", "#55A868"])
+    axes[1].set_title("Denoising Time")
+    axes[1].set_ylabel("seconds")
+    axes[1].grid(axis="y", alpha=0.2)
+
+    fig.suptitle("Dense vs Sparse Comparison", y=1.02)
+    fig.tight_layout()
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=140)
+    plt.close(fig)
+    return {"saved": True, "path": str(output_path)}
+
+
+def _sparse_value_token(sparsity_cfg):
+    """Generate an identifier token for ratio/variance settings in sparse tags."""
+    if "ratio" in sparsity_cfg:
+        return f"ratio_{str(float(sparsity_cfg.get('ratio', 0.0))).replace('.', 'p')}"
+    if "k" in sparsity_cfg:
+        return f"k_{str(float(sparsity_cfg.get('k', 0.0))).replace('.', 'p')}"
+    if "variance_pct" in sparsity_cfg:
+        return f"vp_{str(float(sparsity_cfg.get('variance_pct', 0.0))).replace('.', 'p')}"
+    return "cfg_default"
+
+
 def _normalize_sparse_method(method_name):
     """Normalize sparse method aliases to canonical method names."""
     normalized = str(method_name).lower()
@@ -268,7 +529,35 @@ def _normalize_sparse_method(method_name):
 
 def _is_during_training_sparse_method(method_name):
     """Return True when sparse method is applied during optimization."""
-    return method_name in {"gradual_magnitude", "sparse_from_scratch"}
+    return method_name in {
+        "gradual_magnitude",
+        "sparse_from_scratch",
+        "sparse_on_training",
+        "sigma_sparse_on_training",
+        "layer_sigma_training",
+    }
+
+
+def _is_compact_sparse_method(method_name):
+    """Return True for methods that physically change the model architecture.
+
+    Compact methods reconstruct smaller layers, so the saved checkpoint
+    has different tensor shapes than the original model definition. They
+    must be saved as full model objects (not state_dicts) to allow correct
+    reloading without knowing the compacted architecture in advance.
+    """
+    return method_name in {
+        "compact_mlp",
+        "compact_lstm",
+        "compact_dlinear",
+        "structured_compact",
+        "post_training_ratio_priority",
+        "ratio_priority",
+        "priority_magnitude",
+        "sparse_on_training",
+        "sigma_sparse_on_training",
+        "layer_sigma_training",
+    }
 
 
 def run_tabular_experiment(config):
@@ -280,6 +569,7 @@ def run_tabular_experiment(config):
     base_dir = _build_artifacts_base_dir(config, domain="tabular")
     artifact_cache = ExperimentCache(base_dir=str(base_dir), signature=signature)
     _store_run_context(artifact_cache, payload, config)
+    _append_run_index(artifact_cache, config, domain="tabular")
 
     _X_clean, _y_clean, X_noisy, y_noisy = _load_or_prepare_tabular_data(config, artifact_cache)
 
@@ -329,8 +619,8 @@ def run_tabular_experiment(config):
             optimizer=optimizer,
             epoch_scheduler=None,
             batch_scheduler=None,
-            patience=model_cfg.get("patience", 10),
-            epochs=model_cfg.get("max_epochs", 50),
+            patience=model_cfg.get("patience", 15),
+            epochs=model_cfg.get("max_epochs", 100),
             checkpoints_path=str(model_ckpt),
             verbose=False,
         )
@@ -359,9 +649,9 @@ def run_tabular_experiment(config):
 
         (X_denoised, y_denoised, _, _), elapsed, vram = _measure_denoising_call(
             lambda: denoiser.transform(
-                nrr=dg_cfg.get("nrr", 1e-3),
-                nr_threshold=dg_cfg.get("threshold", 5e-3),
-                max_epochs=dg_cfg.get("max_iters", 300),
+                nrr=dg_cfg.get("nrr", 0.01),
+                nr_threshold=dg_cfg.get("threshold", 0.1),
+                max_epochs=dg_cfg.get("max_iters", 150),
                 denoise_y=True,
                 batch_size=dg_cfg.get("batch_size", 1024),
                 save_gradients=False,
@@ -421,21 +711,26 @@ def run_tabular_experiment(config):
         {"path": str(artifact_cache.json_path("evaluation_dense", kind="metrics"))},
     )
 
+    comparison_plot = {"saved": False, "reason": "not_computed", "path": None}
     if sparsity_cfg.get("enabled", False):
         sparse_method = _normalize_sparse_method(sparsity_cfg.get("method", "magnitude_unstructured"))
         sparse_ratio = float(sparsity_cfg.get("ratio", 0.5))
         include_bias = bool(sparsity_cfg.get("include_bias", False))
-        sparse_tag = f"tabular_sparse_{sparse_method}_{str(sparse_ratio).replace('.', 'p')}"
+        sparse_token = _sparse_value_token(sparsity_cfg)
+        sparse_tag = f"tabular_sparse_{sparse_method}_{sparse_token}"
 
         sparse_model_ckpt = artifact_cache.model_path(
-            f"{model_ckpt_name}_{sparse_method}_{str(sparse_ratio).replace('.', 'p')}"
+            f"{model_ckpt_name}_{sparse_method}_{sparse_token}"
         )
         sparse_report_key = f"sparsity_report_{sparse_tag}"
         sparse_report = artifact_cache.load_json(sparse_report_key, kind="metrics")
 
         if sparse_model_ckpt.exists():
-            sparse_backbone = get_model(model_cfg, input_dim=input_dim, output_dim=output_dim, device=str(device))
-            sparse_backbone.load_state_dict(torch.load(sparse_model_ckpt, map_location=device))
+            if _is_compact_sparse_method(sparse_method):
+                sparse_backbone = torch.load(sparse_model_ckpt, map_location=device, weights_only=False)
+            else:
+                sparse_backbone = get_model(model_cfg, input_dim=input_dim, output_dim=output_dim, device=str(device))
+                sparse_backbone.load_state_dict(torch.load(sparse_model_ckpt, map_location=device, weights_only=False))
             if sparse_report is None:
                 sparse_report = {
                     "method": sparse_method,
@@ -449,6 +744,12 @@ def run_tabular_experiment(config):
                 criterion = nn.MSELoss()
                 optimizer = torch.optim.Adam(sparse_backbone.parameters(), lr=model_cfg.get("lr", 0.001))
                 sparse_controller = build_training_sparsity_controller(sparse_method, sparsity_cfg)
+                masked_model_ckpt = artifact_cache.model_path(
+                    f"{model_ckpt_name}_{sparse_method}_{sparse_token}_masked"
+                )
+                compact_model_ckpt = artifact_cache.model_path(
+                    f"{model_ckpt_name}_{sparse_method}_{sparse_token}_compact"
+                )
                 sparse_trainer = Trainer(
                     model=sparse_backbone,
                     train_generator=loaders_noisy[0],
@@ -458,17 +759,75 @@ def run_tabular_experiment(config):
                     optimizer=optimizer,
                     epoch_scheduler=None,
                     batch_scheduler=None,
-                    patience=model_cfg.get("patience", 10),
-                    epochs=model_cfg.get("max_epochs", 50),
+                    patience=model_cfg.get("patience", 15),
+                    epochs=model_cfg.get("max_epochs", 100),
                     checkpoints_path=str(sparse_model_ckpt),
                     verbose=False,
                     sparsity_controller=sparse_controller,
                 )
                 sparse_backbone, _, _, _, _ = sparse_trainer.fit()
+                torch.save(sparse_backbone.state_dict(), masked_model_ckpt)
+
+                compact_cfg = dict(sparsity_cfg)
+                compact_method = _normalize_sparse_method(
+                    compact_cfg.get("post_training_method", "structured_compact")
+                )
+                compact_ratio = float(compact_cfg.get("compact_ratio", sparse_ratio))
+                compact_cfg.update(
+                    {
+                        "ratio": compact_ratio,
+                        "device": str(device),
+                        "include_bias": include_bias,
+                    }
+                )
+                sparse_backbone, compact_report = apply_post_training_sparsification(
+                    model=sparse_backbone,
+                    method=compact_method,
+                    config=compact_cfg,
+                    inplace=True,
+                )
+                torch.save(sparse_backbone, compact_model_ckpt)
+
+                ft_cfg = _as_dict(sparsity_cfg.get("fine_tune", {}))
+                ft_epochs = int(ft_cfg.get("epochs", sparsity_cfg.get("fine_tune_epochs", 12)))
+                ft_patience = int(ft_cfg.get("patience", sparsity_cfg.get("fine_tune_patience", 5)))
+                ft_lr_scale = float(ft_cfg.get("lr_scale", sparsity_cfg.get("fine_tune_lr_scale", 0.1)))
+                ft_lr = model_cfg.get("lr", 0.001) * ft_lr_scale
+                ft_optimizer = torch.optim.Adam(sparse_backbone.parameters(), lr=ft_lr)
+                ft_trainer = Trainer(
+                    model=sparse_backbone,
+                    train_generator=loaders_noisy[0],
+                    val_generator=loaders_noisy[1],
+                    device=device,
+                    criterion=criterion,
+                    optimizer=ft_optimizer,
+                    epoch_scheduler=None,
+                    batch_scheduler=None,
+                    patience=ft_patience,
+                    epochs=ft_epochs,
+                    checkpoints_path=str(sparse_model_ckpt),
+                    verbose=False,
+                    sparsity_controller=None,
+                )
+                sparse_backbone, _, _, _, _ = ft_trainer.fit()
+
                 sparse_report = {
                     "method": sparse_method,
                     "requested_sparsity": sparse_ratio,
+                    "pipeline": "hybrid_on_training_compaction_finetune",
                     "training_controller": sparse_controller.report(),
+                    "compact_report": compact_report,
+                    "fine_tune": {
+                        "epochs": ft_epochs,
+                        "patience": ft_patience,
+                        "lr_scale": ft_lr_scale,
+                        "lr": ft_lr,
+                    },
+                    "phase_artifacts": {
+                        "masked_model": str(masked_model_ckpt),
+                        "compact_model": str(compact_model_ckpt),
+                        "finetuned_model": str(sparse_model_ckpt),
+                    },
                     "final_stats": summarize_sparsity(
                         sparse_backbone,
                         include_bias=include_bias,
@@ -485,7 +844,10 @@ def run_tabular_experiment(config):
                     inplace=True,
                 )
 
-            torch.save(sparse_backbone.state_dict(), sparse_model_ckpt)
+            if _is_compact_sparse_method(sparse_method):
+                torch.save(sparse_backbone, sparse_model_ckpt)
+            else:
+                torch.save(sparse_backbone.state_dict(), sparse_model_ckpt)
             artifact_cache.save_json(sparse_report, sparse_report_key, kind="metrics")
 
         sparse_weight_stats, sparse_weight_fig = _analyze_and_store_weights(
@@ -512,9 +874,9 @@ def run_tabular_experiment(config):
             sparse_denoiser.fit(X=X_noisy, y=y_noisy, is_ts=False)
             (X_denoised_sparse, y_denoised_sparse, _, _), sparse_elapsed, sparse_vram = _measure_denoising_call(
                 lambda: sparse_denoiser.transform(
-                    nrr=dg_cfg.get("nrr", 1e-3),
-                    nr_threshold=dg_cfg.get("threshold", 5e-3),
-                    max_epochs=dg_cfg.get("max_iters", 300),
+                    nrr=dg_cfg.get("nrr", 0.01),
+                    nr_threshold=dg_cfg.get("threshold", 0.1),
+                    max_epochs=dg_cfg.get("max_iters", 150),
                     denoise_y=True,
                     batch_size=dg_cfg.get("batch_size", 1024),
                     save_gradients=False,
@@ -568,6 +930,25 @@ def run_tabular_experiment(config):
             "stats": sparse_weight_stats,
             "histogram_figure": sparse_weight_fig,
         }
+
+        dense_sparse_comparison = _build_dense_sparse_comparison(
+            summary.get("denoising_profile", {}),
+            sparse_denoise_metrics,
+        )
+        comparison_key = f"dense_vs_sparse_comparison_{sparse_tag}"
+        artifact_cache.save_json(dense_sparse_comparison, comparison_key, kind="metrics")
+        artifact_cache.write_text(
+            f"{comparison_key}_table",
+            _comparison_table_markdown(dense_sparse_comparison),
+            kind="logs",
+        )
+        comparison_plot = _save_dense_sparse_plot(
+            dense_sparse_comparison,
+            artifact_cache.paths.figures / f"{comparison_key}.png",
+        )
+        summary["sparse"]["dense_vs_sparse_comparison"] = dense_sparse_comparison
+        summary["sparse"]["dense_vs_sparse_plot"] = comparison_plot
+
         artifact_cache.save_json(sparse_evaluation, "evaluation_sparse", kind="metrics")
         artifact_cache.save_json(summary["sparse"], "sparse_summary", kind="metrics")
         artifact_cache.update_manifest(
@@ -577,6 +958,15 @@ def run_tabular_experiment(config):
         artifact_cache.update_manifest(
             "sparse_summary",
             {"path": str(artifact_cache.json_path("sparse_summary", kind="metrics"))},
+        )
+        artifact_cache.update_manifest(
+            comparison_key,
+            {
+                "json": str(artifact_cache.json_path(comparison_key, kind="metrics")),
+                "table": str(artifact_cache.text_path(f"{comparison_key}_table", kind="logs")),
+                "plot": comparison_plot.get("path"),
+                "plot_saved": comparison_plot.get("saved", False),
+            },
         )
 
     artifact_cache.save_json(summary, "summary_tabular", kind="metrics")
@@ -596,6 +986,7 @@ def run_ts_experiment(config):
     base_dir = _build_artifacts_base_dir(config, domain="time_series")
     artifact_cache = ExperimentCache(base_dir=str(base_dir), signature=signature)
     _store_run_context(artifact_cache, payload, config)
+    _append_run_index(artifact_cache, config, domain="time_series")
 
     _X_clean, _y_clean, X_noisy, y_noisy = _load_or_prepare_ts_data(config, artifact_cache)
 
@@ -657,8 +1048,8 @@ def run_ts_experiment(config):
             optimizer=optimizer,
             epoch_scheduler=None,
             batch_scheduler=None,
-            patience=model_cfg.get("patience", 10),
-            epochs=model_cfg.get("max_epochs", 50),
+            patience=model_cfg.get("patience", 15),
+            epochs=model_cfg.get("max_epochs", 100),
             checkpoints_path=str(model_ckpt),
             verbose=False,
         )
@@ -694,9 +1085,9 @@ def run_ts_experiment(config):
 
         (X_denoised, y_denoised, _, _), elapsed, vram = _measure_denoising_call(
             lambda: denoiser.transform(
-                nrr=dg_cfg.get("nrr", 1e-3),
-                nr_threshold=dg_cfg.get("threshold", 5e-3),
-                max_epochs=dg_cfg.get("max_iters", 300),
+                nrr=dg_cfg.get("nrr", 0.01),
+                nr_threshold=dg_cfg.get("threshold", 0.1),
+                max_epochs=dg_cfg.get("max_iters", 150),
                 denoise_y=True,
                 batch_size=dg_cfg.get("batch_size", 1024),
                 save_gradients=False,
@@ -758,27 +1149,32 @@ def run_ts_experiment(config):
         {"path": str(artifact_cache.json_path("evaluation_dense", kind="metrics"))},
     )
 
+    comparison_plot = {"saved": False, "reason": "not_computed", "path": None}
     if sparsity_cfg.get("enabled", False):
         sparse_method = _normalize_sparse_method(sparsity_cfg.get("method", "magnitude_unstructured"))
         sparse_ratio = float(sparsity_cfg.get("ratio", 0.5))
         include_bias = bool(sparsity_cfg.get("include_bias", False))
-        sparse_tag = f"ts_sparse_{sparse_method}_{str(sparse_ratio).replace('.', 'p')}"
+        sparse_token = _sparse_value_token(sparsity_cfg)
+        sparse_tag = f"ts_sparse_{sparse_method}_{sparse_token}"
 
         sparse_model_ckpt = artifact_cache.model_path(
-            f"{model_ckpt_name}_{sparse_method}_{str(sparse_ratio).replace('.', 'p')}"
+            f"{model_ckpt_name}_{sparse_method}_{sparse_token}"
         )
         sparse_report_key = f"sparsity_report_{sparse_tag}"
         sparse_report = artifact_cache.load_json(sparse_report_key, kind="metrics")
 
         if sparse_model_ckpt.exists():
-            sparse_backbone = get_model(
-                model_cfg,
-                input_dim=input_dim,
-                output_dim=output_dim,
-                device=str(device),
-                seq_len=window_size,
-            )
-            sparse_backbone.load_state_dict(torch.load(sparse_model_ckpt, map_location=device))
+            if _is_compact_sparse_method(sparse_method):
+                sparse_backbone = torch.load(sparse_model_ckpt, map_location=device, weights_only=False)
+            else:
+                sparse_backbone = get_model(
+                    model_cfg,
+                    input_dim=input_dim,
+                    output_dim=output_dim,
+                    device=str(device),
+                    seq_len=window_size,
+                )
+                sparse_backbone.load_state_dict(torch.load(sparse_model_ckpt, map_location=device, weights_only=False))
             if sparse_report is None:
                 sparse_report = {
                     "method": sparse_method,
@@ -798,6 +1194,12 @@ def run_ts_experiment(config):
                 criterion = nn.MSELoss()
                 optimizer = torch.optim.Adam(sparse_backbone.parameters(), lr=model_cfg.get("lr", 0.001))
                 sparse_controller = build_training_sparsity_controller(sparse_method, sparsity_cfg)
+                masked_model_ckpt = artifact_cache.model_path(
+                    f"{model_ckpt_name}_{sparse_method}_{sparse_token}_masked"
+                )
+                compact_model_ckpt = artifact_cache.model_path(
+                    f"{model_ckpt_name}_{sparse_method}_{sparse_token}_compact"
+                )
                 sparse_trainer = Trainer(
                     model=sparse_backbone,
                     train_generator=loaders_noisy[0],
@@ -807,17 +1209,75 @@ def run_ts_experiment(config):
                     optimizer=optimizer,
                     epoch_scheduler=None,
                     batch_scheduler=None,
-                    patience=model_cfg.get("patience", 10),
-                    epochs=model_cfg.get("max_epochs", 50),
+                    patience=model_cfg.get("patience", 15),
+                    epochs=model_cfg.get("max_epochs", 100),
                     checkpoints_path=str(sparse_model_ckpt),
                     verbose=False,
                     sparsity_controller=sparse_controller,
                 )
                 sparse_backbone, _, _, _, _ = sparse_trainer.fit()
+                torch.save(sparse_backbone.state_dict(), masked_model_ckpt)
+
+                compact_cfg = dict(sparsity_cfg)
+                compact_method = _normalize_sparse_method(
+                    compact_cfg.get("post_training_method", "structured_compact")
+                )
+                compact_ratio = float(compact_cfg.get("compact_ratio", sparse_ratio))
+                compact_cfg.update(
+                    {
+                        "ratio": compact_ratio,
+                        "device": str(device),
+                        "include_bias": include_bias,
+                    }
+                )
+                sparse_backbone, compact_report = apply_post_training_sparsification(
+                    model=sparse_backbone,
+                    method=compact_method,
+                    config=compact_cfg,
+                    inplace=True,
+                )
+                torch.save(sparse_backbone, compact_model_ckpt)
+
+                ft_cfg = _as_dict(sparsity_cfg.get("fine_tune", {}))
+                ft_epochs = int(ft_cfg.get("epochs", sparsity_cfg.get("fine_tune_epochs", 12)))
+                ft_patience = int(ft_cfg.get("patience", sparsity_cfg.get("fine_tune_patience", 5)))
+                ft_lr_scale = float(ft_cfg.get("lr_scale", sparsity_cfg.get("fine_tune_lr_scale", 0.1)))
+                ft_lr = model_cfg.get("lr", 0.001) * ft_lr_scale
+                ft_optimizer = torch.optim.Adam(sparse_backbone.parameters(), lr=ft_lr)
+                ft_trainer = Trainer(
+                    model=sparse_backbone,
+                    train_generator=loaders_noisy[0],
+                    val_generator=loaders_noisy[1],
+                    device=device,
+                    criterion=criterion,
+                    optimizer=ft_optimizer,
+                    epoch_scheduler=None,
+                    batch_scheduler=None,
+                    patience=ft_patience,
+                    epochs=ft_epochs,
+                    checkpoints_path=str(sparse_model_ckpt),
+                    verbose=False,
+                    sparsity_controller=None,
+                )
+                sparse_backbone, _, _, _, _ = ft_trainer.fit()
+
                 sparse_report = {
                     "method": sparse_method,
                     "requested_sparsity": sparse_ratio,
+                    "pipeline": "hybrid_on_training_compaction_finetune",
                     "training_controller": sparse_controller.report(),
+                    "compact_report": compact_report,
+                    "fine_tune": {
+                        "epochs": ft_epochs,
+                        "patience": ft_patience,
+                        "lr_scale": ft_lr_scale,
+                        "lr": ft_lr,
+                    },
+                    "phase_artifacts": {
+                        "masked_model": str(masked_model_ckpt),
+                        "compact_model": str(compact_model_ckpt),
+                        "finetuned_model": str(sparse_model_ckpt),
+                    },
                     "final_stats": summarize_sparsity(
                         sparse_backbone,
                         include_bias=include_bias,
@@ -834,7 +1294,10 @@ def run_ts_experiment(config):
                     inplace=True,
                 )
 
-            torch.save(sparse_backbone.state_dict(), sparse_model_ckpt)
+            if _is_compact_sparse_method(sparse_method):
+                torch.save(sparse_backbone, sparse_model_ckpt)
+            else:
+                torch.save(sparse_backbone.state_dict(), sparse_model_ckpt)
             artifact_cache.save_json(sparse_report, sparse_report_key, kind="metrics")
 
         sparse_weight_stats, sparse_weight_fig = _analyze_and_store_weights(
@@ -868,9 +1331,9 @@ def run_ts_experiment(config):
             )
             (X_denoised_sparse, y_denoised_sparse, _, _), sparse_elapsed, sparse_vram = _measure_denoising_call(
                 lambda: sparse_denoiser.transform(
-                    nrr=dg_cfg.get("nrr", 1e-3),
-                    nr_threshold=dg_cfg.get("threshold", 5e-3),
-                    max_epochs=dg_cfg.get("max_iters", 300),
+                    nrr=dg_cfg.get("nrr", 0.01),
+                    nr_threshold=dg_cfg.get("threshold", 0.1),
+                    max_epochs=dg_cfg.get("max_iters", 150),
                     denoise_y=True,
                     batch_size=dg_cfg.get("batch_size", 1024),
                     save_gradients=False,
@@ -926,6 +1389,25 @@ def run_ts_experiment(config):
             "stats": sparse_weight_stats,
             "histogram_figure": sparse_weight_fig,
         }
+
+        dense_sparse_comparison = _build_dense_sparse_comparison(
+            summary.get("denoising_profile", {}),
+            sparse_denoise_metrics,
+        )
+        comparison_key = f"dense_vs_sparse_comparison_{sparse_tag}"
+        artifact_cache.save_json(dense_sparse_comparison, comparison_key, kind="metrics")
+        artifact_cache.write_text(
+            f"{comparison_key}_table",
+            _comparison_table_markdown(dense_sparse_comparison),
+            kind="logs",
+        )
+        comparison_plot = _save_dense_sparse_plot(
+            dense_sparse_comparison,
+            artifact_cache.paths.figures / f"{comparison_key}.png",
+        )
+        summary["sparse"]["dense_vs_sparse_comparison"] = dense_sparse_comparison
+        summary["sparse"]["dense_vs_sparse_plot"] = comparison_plot
+
         artifact_cache.save_json(sparse_evaluation, "evaluation_sparse", kind="metrics")
         artifact_cache.save_json(summary["sparse"], "sparse_summary", kind="metrics")
         artifact_cache.update_manifest(
@@ -935,6 +1417,15 @@ def run_ts_experiment(config):
         artifact_cache.update_manifest(
             "sparse_summary",
             {"path": str(artifact_cache.json_path("sparse_summary", kind="metrics"))},
+        )
+        artifact_cache.update_manifest(
+            comparison_key,
+            {
+                "json": str(artifact_cache.json_path(comparison_key, kind="metrics")),
+                "table": str(artifact_cache.text_path(f"{comparison_key}_table", kind="logs")),
+                "plot": comparison_plot.get("path"),
+                "plot_saved": comparison_plot.get("saved", False),
+            },
         )
 
     artifact_cache.save_json(summary, "summary_ts", kind="metrics")

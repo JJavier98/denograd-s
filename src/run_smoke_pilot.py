@@ -6,7 +6,7 @@ import argparse
 import json
 from pathlib import Path
 
-from src.experiment_runner import run_tabular_experiment, run_ts_experiment
+from src.libs.experiment_runner import run_tabular_experiment, run_ts_experiment
 
 
 def _base_sparse_cfg(method: str, ratio: float) -> dict:
@@ -138,7 +138,7 @@ def main() -> None:
     print("[SMOKE] Running time-series experiment...")
     ts_summary = run_ts_experiment(ts_cfg)
 
-    out_path = Path(args.artifacts_dir) / "smoke_summary.json"
+    out_path = Path(args.artifacts_dir) / "meta" / "summaries" / "smoke_summary.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(
         json.dumps({"tabular": tab_summary, "time_series": ts_summary}, indent=2),

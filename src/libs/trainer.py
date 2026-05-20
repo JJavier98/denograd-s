@@ -7,7 +7,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from src.utils import Colors, make_dir
+from src.libs.utils import Colors, make_dir
 
 try:
     import wandb

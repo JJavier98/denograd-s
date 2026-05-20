@@ -27,9 +27,9 @@ from src.models.dnn import TabularDNN
 from src.models.lstm import MultivariateLSTM
 from src.models.xlstm_adapter import xLSTMAdapter
 from src.models.dlinear_adapter import DLinearAdapter
-from src.profiling import benchmark_inference, model_size_bytes
-from src.trainer import Trainer
-from src.utils import extract_data_from_loader
+from src.libs.profiling import benchmark_inference, model_size_bytes
+from src.libs.trainer import Trainer
+from src.libs.utils import extract_data_from_loader
 
 class PermuteAndRun(nn.Module):
     """

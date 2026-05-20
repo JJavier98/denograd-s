@@ -56,6 +56,7 @@ class DLinearAdapter(nn.Module):
         self.decomposition = SeriesDecomp(kernel_size)
         self.individual = individual
         self.channels = input_dim
+        self.selected_lag_indices = None
 
         if self.individual:
             self.Linear_Seasonal = nn.ModuleList()
@@ -72,6 +73,10 @@ class DLinearAdapter(nn.Module):
         # x: [Batch, Input length, Channel]
         seasonal_init, trend_init = self.decomposition(x)
         seasonal_init, trend_init = seasonal_init.permute(0,2,1), trend_init.permute(0,2,1)
+
+        if self.selected_lag_indices is not None:
+            seasonal_init = seasonal_init[:, :, self.selected_lag_indices]
+            trend_init = trend_init[:, :, self.selected_lag_indices]
 
         if self.individual:
             seasonal_output = torch.zeros([seasonal_init.size(0),seasonal_init.size(1),self.pred_len],dtype=seasonal_init.dtype).to(seasonal_init.device)
