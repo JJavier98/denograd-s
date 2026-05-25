@@ -1,0 +1,41 @@
+% Comparativa DenoGrad: Dense vs Sparse Backbone (mediana)
+% Basado en resultados de:
+% - out/meta/summaries/energy_campaign_gpu0_tabular_results.json
+% - out/meta/summaries/energy_campaign_gpu1_time_series_results.json
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{lrrrrrr}
+\hline
+Dominio & Mejora dense (\%) & Mejora sparse (\%) & Delta (pp) & Red. neuronas (\%) & Red. peso (\%) & Aceleracion (\%) \\
+\hline
+Tabular & 50.3905 & 51.4109 & +1.0204 & 23.46 & 23.46 & 7.54 \\
+Series temporales & 73.4486 & 73.6065 & +0.1580 & 34.96 & 34.96 & 1.43 \\
+Global & 57.9145 & 61.8083 & +3.8938 & 40.64 & 40.64 & 6.96 \\
+\hline
+\end{tabular}
+\caption{Comparativa DenoGrad con backbone dense vs sparse usando medianas.}
+\label{tab:denograd_sparse_median}
+\end{table}
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{lrrrr}
+\hline
+Dominio & Neuronas dense & Neuronas sparse & Tiempo dense (s) & Tiempo sparse (s) \\
+\hline
+Tabular & 12801 & 9798 & 26.5887 & 24.5830 \\
+Series temporales & 51521 & 33508 & 5.4801 & 5.4016 \\
+Global & 51265 & 30430 & 26.0444 & 24.2313 \\
+\hline
+\end{tabular}
+\caption{Medianas de tamano de modelo y tiempo de denoising por dominio.}
+\label{tab:denograd_sparse_size_time}
+\end{table}
+
+% Nota para el texto del articulo/informe:
+% - Tabular: min=-111.3691, max=79.9725, positivas=57/60.
+% - Series temporales: min=-2349.6443, max=86.1058, positivas=72/78.
+% Se recomienda mantener la mediana como metrica principal y comentar los outliers en la discusion.
